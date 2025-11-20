@@ -14,6 +14,8 @@ add_library(nebula_core
     src/nebula_log.cpp
     src/nebula_wire.cpp
     src/segment.cpp
+    src/topic_manager.cpp
+    src/cluster.cpp
 )
 
 target_include_directories(nebula_core PUBLIC src)
@@ -39,6 +41,26 @@ target_link_libraries(test_nebula_log
 # Test 2
 add_executable(test_nebula_wire tests/test_nebula_wire.cpp)
 target_link_libraries(test_nebula_wire
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+# Test 3
+add_executable(test_topics tests/test_topics.cpp)
+target_link_libraries(test_topics
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+# Test 4
+add_executable(test_gossip tests/test_gossip.cpp)
+target_link_libraries(test_gossip
     PRIVATE
         nebula_core
         Boost::system

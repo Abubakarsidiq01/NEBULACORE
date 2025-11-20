@@ -16,6 +16,7 @@ add_library(nebula_core
     src/segment.cpp
     src/topic_manager.cpp
     src/cluster.cpp
+    src/leader.cpp
 )
 
 target_include_directories(nebula_core PUBLIC src)
@@ -67,3 +68,14 @@ target_link_libraries(test_gossip
         ws2_32
         mswsock
 )
+
+# Test 5
+add_executable(test_leader tests/test_leader.cpp)
+target_link_libraries(test_leader
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+

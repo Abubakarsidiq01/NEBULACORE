@@ -18,6 +18,7 @@ add_library(nebula_core
     src/cluster.cpp
     src/leader.cpp
     src/nebula_node.cpp
+    src/node_server.cpp
 )
 
 target_include_directories(nebula_core PUBLIC src)
@@ -83,6 +84,16 @@ target_link_libraries(test_leader
 # Test 6
 add_executable(test_node tests/test_node.cpp)
 target_link_libraries(test_node
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+# Test 7
+add_executable(test_node_server tests/test_node_server.cpp)
+target_link_libraries(test_node_server
     PRIVATE
         nebula_core
         Boost::system

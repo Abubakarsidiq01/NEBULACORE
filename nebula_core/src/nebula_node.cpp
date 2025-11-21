@@ -2,8 +2,8 @@
 
 #include <chrono>
 #include <filesystem>
-#include <stdexcept>
 #include <iostream>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 
@@ -19,7 +19,7 @@ NebulaNode::NebulaNode(const NebulaNodeConfig& cfg)
     cluster_ = std::make_unique<GossipCluster>(io_, cfg_.self, cfg_.peers);
     elector_ = std::make_unique<LeaderElector>(io_, *cluster_, cfg_.self.id);
 
-    // Modern work guard
+    // Keep io_context alive
     work_guard_.emplace(boost::asio::make_work_guard(io_));
 }
 
@@ -61,6 +61,34 @@ std::optional<std::string> NebulaNode::leader_id() const {
     return elector_->leader_id();
 }
 
+void NebulaNode::set_replication_peers(const std::vector<NebulaNode*>& peers) {
+    replication_peers_ = peers;
+}
+
+/*
+    Follower append:
+    - No leader checks
+    - Followers simply append to their local log
+*/
+std::pair<std::size_t, uint64_t> NebulaNode::replicate_publish(
+    const std::string& topic,
+    const std::string& key,
+    const std::string& payload) {
+
+    TopicConfig cfg;
+    cfg.name = topic;
+    cfg.num_partitions = cfg_.default_partitions;
+    topics_->create_topic(cfg);
+
+    return topics_->publish(topic, key, payload);
+}
+
+/*
+    Leader publish:
+    - Append locally
+    - Replicate to followers
+    - Require majority acknowledgement
+*/
 std::pair<std::size_t, uint64_t> NebulaNode::publish(
     const std::string& topic,
     const std::string& key,
@@ -75,7 +103,31 @@ std::pair<std::size_t, uint64_t> NebulaNode::publish(
     cfg.num_partitions = cfg_.default_partitions;
     topics_->create_topic(cfg);
 
-    return topics_->publish(topic, key, payload);
+    // Leader applies locally
+    auto local_res = topics_->publish(topic, key, payload);
+    std::size_t successes = 1;  // leader itself
+
+    const std::size_t total_nodes = replication_peers_.size() + 1;
+    const std::size_t majority = total_nodes / 2 + 1;
+
+    // Replicate to followers
+    for (NebulaNode* peer : replication_peers_) {
+        if (!peer) {
+            continue;
+        }
+        try {
+            peer->replicate_publish(topic, key, payload);
+            successes += 1;
+        } catch (const std::exception& ex) {
+            std::cerr << "Replication failed on peer: " << ex.what() << "\n";
+        }
+    }
+
+    if (successes < majority) {
+        throw std::runtime_error("replication did not reach majority");
+    }
+
+    return local_res;
 }
 
 std::optional<std::string> NebulaNode::consume(

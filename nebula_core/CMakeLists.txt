@@ -100,3 +100,13 @@ target_link_libraries(test_node_server
         ws2_32
         mswsock
 )
+
+# Test 8
+add_executable(test_replication tests/test_replication.cpp)
+target_link_libraries(test_replication
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)

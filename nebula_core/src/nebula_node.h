@@ -31,15 +31,26 @@ public:
     bool is_leader() const;
     std::optional<std::string> leader_id() const;
 
+    // Leader-only publish (performs replication)
     std::pair<std::size_t, uint64_t> publish(
         const std::string& topic,
         const std::string& key,
         const std::string& payload);
 
+    // Follower append path (no leader checks)
+    std::pair<std::size_t, uint64_t> replicate_publish(
+        const std::string& topic,
+        const std::string& key,
+        const std::string& payload);
+
+    // Consuming messages from local partitions
     std::optional<std::string> consume(
         const std::string& topic,
         const std::string& consumer_group,
         std::size_t partition_index);
+
+    // Replication peers (other NebulaNode instances)
+    void set_replication_peers(const std::vector<NebulaNode*>& peers);
 
     const NebulaNodeConfig& config() const { return cfg_; }
 
@@ -56,6 +67,8 @@ private:
     std::unique_ptr<GossipCluster> cluster_;
     std::unique_ptr<LeaderElector> elector_;
     std::unique_ptr<TopicManager> topics_;
+
+    std::vector<NebulaNode*> replication_peers_;
 
     void run_io();
 };

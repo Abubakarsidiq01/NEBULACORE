@@ -1,5 +1,6 @@
 #include "nebula_node.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -105,26 +106,49 @@ std::pair<std::size_t, uint64_t> NebulaNode::publish(
 
     // Leader applies locally
     auto local_res = topics_->publish(topic, key, payload);
-    std::size_t successes = 1;  // leader itself
+    std::size_t partition_index = local_res.first;
+    uint64_t local_offset = local_res.second;
 
-    const std::size_t total_nodes = replication_peers_.size() + 1;
-    const std::size_t majority = total_nodes / 2 + 1;
-
-    // Replicate to followers
+    // Collect offsets from followers
+    std::vector<uint64_t> follower_offsets;
+    follower_offsets.reserve(replication_peers_.size());
     for (NebulaNode* peer : replication_peers_) {
-        if (!peer) {
-            continue;
-        }
+        if (!peer) continue;
         try {
-            peer->replicate_publish(topic, key, payload);
-            successes += 1;
+            auto peer_res = peer->replicate_publish(topic, key, payload);
+            // peer_res.first should equal partition_index if your hashing is deterministic
+            follower_offsets.push_back(peer_res.second);
         } catch (const std::exception& ex) {
             std::cerr << "Replication failed on peer: " << ex.what() << "\n";
         }
     }
 
-    if (successes < majority) {
-        throw std::runtime_error("replication did not reach majority");
+    // Now compute commit index for this partition.
+    // We have one local offset and N follower offsets.
+    // Total nodes = 1 leader + follower_offsets.size()
+    const std::size_t total_nodes = follower_offsets.size() + 1;
+    const std::size_t quorum = (total_nodes / 2) + 1;
+
+    // Combine all offsets including leader
+    std::vector<uint64_t> all_offsets;
+    all_offsets.reserve(total_nodes);
+    all_offsets.push_back(local_offset);
+    for (auto off : follower_offsets) {
+        all_offsets.push_back(off);
+    }
+    std::sort(all_offsets.begin(), all_offsets.end());
+
+    // Commit index is the value at position quorum minus one
+    uint64_t new_commit = all_offsets[quorum - 1];
+
+    PartitionKey key_partition{topic, partition_index};
+    auto it = commit_index_.find(key_partition);
+    if (it == commit_index_.end()) {
+        commit_index_[key_partition] = new_commit;
+    } else {
+        if (new_commit > it->second) {
+            it->second = new_commit;
+        }
     }
 
     return local_res;
@@ -136,6 +160,16 @@ std::optional<std::string> NebulaNode::consume(
     std::size_t partition_index) {
 
     return topics_->read_next(topic, consumer_group, partition_index);
+}
+
+uint64_t NebulaNode::committed_offset(const std::string& topic,
+                                      std::size_t partition) const {
+    PartitionKey key{topic, partition};
+    auto it = commit_index_.find(key);
+    if (it == commit_index_.end()) {
+        return 0;
+    }
+    return it->second;
 }
 
 }  // namespace nebula

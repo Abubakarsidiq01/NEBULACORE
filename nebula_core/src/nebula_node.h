@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -7,6 +8,9 @@
 #include <optional>
 
 #include <boost/asio.hpp>
+#include <unordered_map>
+#include <functional>
+
 
 #include "cluster.h"
 #include "leader.h"
@@ -52,9 +56,30 @@ public:
     // Replication peers (other NebulaNode instances)
     void set_replication_peers(const std::vector<NebulaNode*>& peers);
 
+    // Return the committed offset for a topic partition on this node
+    // Zero means nothing committed yet
+    uint64_t committed_offset(const std::string& topic, std::size_t partition) const;
+
     const NebulaNodeConfig& config() const { return cfg_; }
 
 private:
+    struct PartitionKey {
+        std::string topic;
+        std::size_t partition;
+
+        bool operator==(const PartitionKey& other) const {
+            return partition == other.partition && topic == other.topic;
+        }
+    };
+
+    struct PartitionKeyHash {
+        std::size_t operator()(const PartitionKey& k) const noexcept {
+            std::size_t h1 = std::hash<std::string>{}(k.topic);
+            std::size_t h2 = std::hash<std::size_t>{}(k.partition);
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+        }
+    };
+
     NebulaNodeConfig cfg_;
 
     boost::asio::io_context io_;
@@ -69,6 +94,9 @@ private:
     std::unique_ptr<TopicManager> topics_;
 
     std::vector<NebulaNode*> replication_peers_;
+
+    // Per partition commit index, only meaningful on leader
+    std::unordered_map<PartitionKey, uint64_t, PartitionKeyHash> commit_index_;
 
     void run_io();
 };

@@ -110,3 +110,13 @@ target_link_libraries(test_replication
         ws2_32
         mswsock
 )
+
+# Test 9
+add_executable(test_commit_index tests/test_commit_index.cpp)
+target_link_libraries(test_commit_index
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)

@@ -171,3 +171,13 @@ target_link_libraries(test_raft_phase4
         ws2_32
         mswsock
 )
+
+# Test 15 RAFT Stability
+add_executable(test_raft_phase5 tests/test_raft_phase5.cpp)
+target_link_libraries(test_raft_phase5
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)

@@ -24,7 +24,8 @@ bool RaftNode::is_log_up_to_date(uint64_t other_last_index,
 
     if (other_last_term > my_last_term) return true;
     if (other_last_term < my_last_term) return false;
-    // same term, compare index
+
+    // same term → compare index
     return other_last_index >= my_last_index;
 }
 
@@ -34,7 +35,7 @@ void RaftNode::become_follower(uint64_t new_term) {
     voted_for_.reset();
     leader_id_.reset();
     votes_received_ = 0;
-    // reset timer
+
     election_timeout_ms_ = random_timeout_ms();
     last_heartbeat_ = std::chrono::steady_clock::now();
 }
@@ -43,7 +44,7 @@ void RaftNode::become_candidate() {
     role_ = RaftRole::Candidate;
     current_term_ += 1;
     voted_for_ = id_;
-    votes_received_ = 1; // vote for self
+    votes_received_ = 1;
 
     std::cout << id_ << " became candidate for term " << current_term_ << "\n";
 
@@ -56,16 +57,17 @@ void RaftNode::become_candidate() {
 
     for (RaftNode* p : peers_) {
         auto res = p->handle_request_vote(req);
-        if (res.vote_granted) {
-            votes_received_++;
-        }
+
         if (res.term > current_term_) {
             become_follower(res.term);
             return;
         }
+
+        if (res.vote_granted)
+            votes_received_++;
     }
 
-    if (votes_received_ > static_cast<int>(peers_.size() / 2)) {
+    if (votes_received_ > (int)peers_.size() / 2) {
         become_leader();
     }
 }
@@ -73,19 +75,19 @@ void RaftNode::become_candidate() {
 void RaftNode::become_leader() {
     role_ = RaftRole::Leader;
     leader_id_ = id_;
-
     std::cout << id_ << " is LEADER for term " << current_term_ << "\n";
 
-    // init leader state
     size_t next = log_.size();
+    next_index_.clear();
+    match_index_.clear();
+
     for (RaftNode* p : peers_) {
         next_index_[p->id_] = next;
-        match_index_[p->id_] = static_cast<size_t>(-1);
+        match_index_[p->id_] = (size_t)-1;
     }
-    // leader itself always has its full log
-    match_index_[id_] = log_.empty() ? static_cast<size_t>(-1) : log_.size() - 1;
 
-    // send initial heartbeats
+    match_index_[id_] = log_.empty() ? (size_t)-1 : log_.size() - 1;
+
     for (RaftNode* p : peers_) {
         send_append_entries_to_peer(p);
     }
@@ -112,14 +114,16 @@ RequestVoteResult RaftNode::handle_request_vote(const RequestVoteRPC& req) {
 }
 
 AppendEntriesResponse RaftNode::handle_append_entries(const AppendEntriesRequest& req) {
-    // 1. reply false if term < current_term
-    if (req.term < static_cast<int>(current_term_)) {
-        return AppendEntriesResponse{ static_cast<int>(current_term_), false,
-                                      log_.empty() ? static_cast<size_t>(-1) : log_.size() - 1 };
+    // 1. Term check
+    if (req.term < (int)current_term_) {
+        return {
+            (int)current_term_,
+            false,
+            log_.empty() ? (size_t)-1 : log_.size() - 1
+        };
     }
 
-    // If term is newer, step down
-    if (req.term > static_cast<int>(current_term_)) {
+    if (req.term > (int)current_term_) {
         become_follower(req.term);
     }
 
@@ -127,50 +131,61 @@ AppendEntriesResponse RaftNode::handle_append_entries(const AppendEntriesRequest
     leader_id_ = req.leader_id;
     last_heartbeat_ = std::chrono::steady_clock::now();
 
-    // 2. consistency check on prev_log_index / prev_log_term
-    if (req.prev_log_index != static_cast<size_t>(-1)) {
-        if (req.prev_log_index >= log_.size()) {
-            return AppendEntriesResponse{ static_cast<int>(current_term_), false,
-                                          log_.empty() ? static_cast<size_t>(-1) : log_.size() - 1 };
-        }
-        if (log_[req.prev_log_index].term != req.prev_log_term) {
-            return AppendEntriesResponse{ static_cast<int>(current_term_), false,
-                                          req.prev_log_index };
+    // 2. Consistency check
+    if (req.prev_log_index != (size_t)-1) {
+        if (req.prev_log_index >= log_.size() ||
+            log_[req.prev_log_index].term != req.prev_log_term)
+        {
+            size_t match =
+                req.prev_log_index < log_.size()
+                ? req.prev_log_index
+                : (log_.empty() ? (size_t)-1 : log_.size() - 1);
+
+            return { (int)current_term_, false, match };
         }
     }
 
-    // 3. apply entries
-    size_t idx = (req.prev_log_index == static_cast<size_t>(-1))
+    // 3. Append / Overwrite entries
+    size_t idx = (req.prev_log_index == (size_t)-1)
                  ? 0
                  : req.prev_log_index + 1;
 
     for (size_t i = 0; i < req.entries.size(); ++i, ++idx) {
         if (idx < log_.size()) {
-            // conflict: overwrite from here
             if (log_[idx].term != req.entries[i].term) {
                 log_.resize(idx);
                 log_.push_back(req.entries[i]);
-            } else {
-                // same term, already present, nothing
             }
+            // same term = already present
         } else {
             log_.push_back(req.entries[i]);
         }
     }
 
-    // 4. update commit index
-    if (req.leader_commit != static_cast<size_t>(-1)) {
-        size_t last_index = log_.empty() ? static_cast<size_t>(-1) : log_.size() - 1;
-        commit_index_ = std::min(req.leader_commit, last_index);
+    // 4. SAFE commit synchronization (followers never overcommit)
+    if (req.leader_commit != (size_t)-1) {
+        size_t last_local = log_.empty() ? (size_t)-1 : log_.size() - 1;
+
+        if (req.leader_commit <= last_local) {
+            commit_index_ = req.leader_commit;
+        }
+        // else: follower cannot commit entries it does not have
     }
 
-    size_t match_idx = log_.empty() ? static_cast<size_t>(-1) : log_.size() - 1;
-    return AppendEntriesResponse{ static_cast<int>(current_term_), true, match_idx };
+    size_t match_idx = log_.empty() ? (size_t)-1 : log_.size() - 1;
+
+    return {
+        (int)current_term_,
+        true,
+        match_idx
+    };
 }
 
-void RaftNode::handle_append_entries_response(const std::string& peer_id,
-                                              const AppendEntriesResponse& resp) {
-    if (resp.term > static_cast<int>(current_term_)) {
+void RaftNode::handle_append_entries_response(
+    const std::string& peer_id,
+    const AppendEntriesResponse& resp)
+{
+    if (resp.term > (int)current_term_) {
         become_follower(resp.term);
         return;
     }
@@ -178,20 +193,15 @@ void RaftNode::handle_append_entries_response(const std::string& peer_id,
     if (role_ != RaftRole::Leader) return;
 
     if (!resp.success) {
-        // follower log is behind or conflicting, back off next_index
-        auto it = next_index_.find(peer_id);
-        if (it != next_index_.end() && it->second > 0) {
-            it->second -= 1;
-        }
+        if (next_index_[peer_id] > 0)
+            next_index_[peer_id] -= 1;
         return;
     }
 
-    // success: advance match_index and next_index
     match_index_[peer_id] = resp.match_index;
     next_index_[peer_id] = resp.match_index + 1;
 
-    // leader always has full log
-    match_index_[id_] = log_.empty() ? static_cast<size_t>(-1) : log_.size() - 1;
+    match_index_[id_] = log_.empty() ? (size_t)-1 : log_.size() - 1;
 
     recompute_commit_index();
 }
@@ -199,53 +209,43 @@ void RaftNode::handle_append_entries_response(const std::string& peer_id,
 void RaftNode::recompute_commit_index() {
     if (log_.empty()) return;
 
-    size_t last_idx = log_.size() - 1;
+    size_t last = log_.size() - 1;
 
-    for (size_t idx = commit_index_ + 1; idx <= last_idx; ++idx) {
-        int count = 1; // leader itself
+    for (size_t idx = commit_index_ + 1; idx <= last; ++idx) {
+
+        // Raft rule: only commit entries from the current term
+        if (log_[idx].term != (int)current_term_)
+            continue;
+
+        int replicated = 1; // leader itself
+
         for (auto& kv : match_index_) {
-            const std::string& peer_id = kv.first;
-            if (peer_id == id_) continue;
-            if (kv.second >= idx) {
-                count++;
-            }
+            if (kv.first == id_) continue;
+            if (kv.second >= idx) replicated++;
         }
-        if (count > static_cast<int>((peers_.size() + 1) / 2) &&
-            log_[idx].term == static_cast<int>(current_term_)) {
+
+        int total = peers_.size() + 1;
+        if (replicated > total / 2) {
             commit_index_ = idx;
         }
     }
 }
 
-void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
-    size_t next = 0;
-    auto it = next_index_.find(peer->id_);
-    if (it == next_index_.end()) {
-        next = log_.size();
-        next_index_[peer->id_] = next;
-    } else {
-        next = it->second;
-    }
 
-    size_t prev_index;
-    int prev_term;
-    if (next == 0) {
-        prev_index = static_cast<size_t>(-1);
-        prev_term = 0;
-    } else {
-        prev_index = next - 1;
-        prev_term = log_[prev_index].term;
-    }
+void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
+    size_t next = next_index_[peer->id_];
+
+    size_t prev_idx = next == 0 ? (size_t)-1 : next - 1;
+    int prev_term = prev_idx == (size_t)-1 ? 0 : log_[prev_idx].term;
 
     std::vector<LogEntry> entries;
-    for (size_t i = next; i < log_.size(); ++i) {
+    for (size_t i = next; i < log_.size(); ++i)
         entries.push_back(log_[i]);
-    }
 
     AppendEntriesRequest req{
         .leader_id = id_,
-        .term = static_cast<int>(current_term_),
-        .prev_log_index = prev_index,
+        .term = (int)current_term_,
+        .prev_log_index = prev_idx,
         .prev_log_term = prev_term,
         .entries = std::move(entries),
         .leader_commit = commit_index_
@@ -256,35 +256,36 @@ void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
 }
 
 void RaftNode::append_client_value(const std::string& value) {
-    if (role_ != RaftRole::Leader) {
-        // for tests we can still allow it, but real Raft would reject
-        std::cout << "append_client_value called on non leader " << id_ << "\n";
-    }
+    // Append entry to leader log
+    log_.push_back({ (int)current_term_, value });
 
-    log_.push_back(LogEntry{ static_cast<int>(current_term_), value });
-
-    // leader has full log
+    // Leader always has its own log replicated
     match_index_[id_] = log_.size() - 1;
 
-    // send to all peers
+    // First round: replicate the new entry to all followers
     for (RaftNode* p : peers_) {
         send_append_entries_to_peer(p);
     }
 
-    // recompute commit index based on new matches
+    // Recompute leader commit index based on new match_index_ values
     recompute_commit_index();
+
+    // Second round: heartbeat with updated leader_commit
+    // This is what pushes commit_index_ to followers like n2 and n3
+    for (RaftNode* p : peers_) {
+        send_append_entries_to_peer(p);
+    }
 }
 
 void RaftNode::tick() {
     auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat_).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now - last_heartbeat_)
+                       .count();
 
     if (role_ == RaftRole::Leader) {
-        // leader heartbeats not modeled as repeated RPCs here,
-        // tests do not depend on timed heartbeats
-        if (elapsed > heartbeat_interval_ms_) {
+        if (elapsed > heartbeat_interval_ms_)
             last_heartbeat_ = now;
-        }
         return;
     }
 

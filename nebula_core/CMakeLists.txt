@@ -19,6 +19,7 @@ add_library(nebula_core
     src/leader.cpp
     src/nebula_node.cpp
     src/node_server.cpp
+    src/raft.cpp
 )
 
 target_include_directories(nebula_core PUBLIC src)
@@ -124,6 +125,46 @@ target_link_libraries(test_commit_index
 # Test 10
 add_executable(test_wal_recovery tests/test_wal_recovery.cpp)
 target_link_libraries(test_wal_recovery
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+# Test 11 RAFT basic timer test
+add_executable(test_raft_phase1 tests/test_raft_phase1.cpp)
+target_link_libraries(test_raft_phase1
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+# Test 12 RAFT RequestVote RPC + Real Leader Election test
+add_executable(test_raft_phase2 tests/test_raft_phase2.cpp)
+target_link_libraries(test_raft_phase2
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+# Test 13 RAFT log replication test
+add_executable(test_raft_phase3 tests/test_raft_phase3.cpp)
+target_link_libraries(test_raft_phase3
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+# Test 14 RAFT commit index test
+add_executable(test_raft_phase4 tests/test_raft_phase4.cpp)
+target_link_libraries(test_raft_phase4
     PRIVATE
         nebula_core
         Boost::system

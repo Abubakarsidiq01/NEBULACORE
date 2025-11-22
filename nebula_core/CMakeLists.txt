@@ -120,3 +120,13 @@ target_link_libraries(test_commit_index
         ws2_32
         mswsock
 )
+
+# Test 10
+add_executable(test_wal_recovery tests/test_wal_recovery.cpp)
+target_link_libraries(test_wal_recovery
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)

@@ -44,7 +44,7 @@ void RaftNode::become_candidate() {
     role_ = RaftRole::Candidate;
     current_term_ += 1;
     voted_for_ = id_;
-    votes_received_ = 1;
+    votes_received_ = 1; // vote for self
 
     std::cout << id_ << " became candidate for term " << current_term_ << "\n";
 
@@ -55,36 +55,68 @@ void RaftNode::become_candidate() {
         .last_log_term = last_log_term()
     };
 
-    for (RaftNode* p : peers_) {
-        // Existing in-memory call (kept for tests)
-        auto res = p->handle_request_vote(req);
+    // -----------------------------
+    // Mode A: test / in-memory mode
+    // -----------------------------
+    if (!transport_) {
+        for (RaftNode* p : peers_) {
+            auto res = p->handle_request_vote(req);
 
-        // NEW: also send over the network if a transport is set
-        if (transport_) {
-            try {
-                transport_->send_request_vote(p->id_, req);
-            } catch (const std::exception& ex) {
-                std::cerr << "[RaftNode " << id_
-                          << "] failed to send RequestVote to "
-                          << p->id_ << ": " << ex.what() << "\n";
-            } catch (...) {
-                // swallow any weird transport errors, don't kill elections
+            if (res.term > current_term_) {
+                become_follower(res.term);
+                return;
             }
+
+            if (res.vote_granted)
+                votes_received_++;
         }
 
-        if (res.term > current_term_) {
-            become_follower(res.term);
-            return;
+        if (votes_received_ > static_cast<int>(peers_.size() / 2)) {
+            become_leader();
         }
-
-        if (res.vote_granted)
-            votes_received_++;
+        return;
     }
 
-    if (votes_received_ > (int)peers_.size() / 2) {
+    // -----------------------------
+    // Mode B: network-only mode
+    // -----------------------------
+    // peer_ids_ must contain all other node IDs (no self).
+    const size_t total_nodes = peer_ids_.size() + 1; // self + peers
+    const size_t quorum = (total_nodes / 2) + 1;
+
+    votes_received_ = 1; // self
+
+    for (const auto& pid : peer_ids_) {
+        try {
+            auto res = transport_->send_request_vote(pid, req);
+
+            if (res.term > current_term_) {
+                // discovered higher term, step down
+                become_follower(res.term);
+                return;
+            }
+
+            if (res.vote_granted)
+                votes_received_++;
+
+        } catch (const std::exception& ex) {
+            std::cerr << "[RaftNode " << id_
+                      << "] RequestVote RPC to "
+                      << pid << " failed: " << ex.what() << "\n";
+        } catch (...) {
+            std::cerr << "[RaftNode " << id_
+                      << "] RequestVote RPC to "
+                      << pid << " failed (unknown error)\n";
+        }
+    }
+
+    if (votes_received_ >= static_cast<int>(quorum)) {
         become_leader();
+    } else {
+        // stay candidate / follower; election timer will trigger again
     }
 }
+
 
 void RaftNode::become_leader() {
     role_ = RaftRole::Leader;
@@ -277,30 +309,37 @@ void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
 
     AppendEntriesRequest req{
         .leader_id = id_,
-        .term = (int)current_term_,
+        .term = static_cast<int>(current_term_),
         .prev_log_index = prev_idx,
         .prev_log_term = prev_term,
         .entries = std::move(entries),
         .leader_commit = commit_index_
     };
 
-    // Existing in-memory call (kept for tests)
-    auto resp = peer->handle_append_entries(req);
-
-    // NEW: also send over the network if a transport is set
-    if (transport_) {
-        try {
-            transport_->send_append_entries(peer->id_, req);
-        } catch (const std::exception& ex) {
-            std::cerr << "[RaftNode " << id_
-                      << "] failed to send AppendEntries to "
-                      << peer->id_ << ": " << ex.what() << "\n";
-        } catch (...) {
-            // ignore non-fatal transport issues
-        }
+    // -----------------------------
+    // Mode A: in-memory for tests
+    // -----------------------------
+    if (!transport_) {
+        auto resp = peer->handle_append_entries(req);
+        handle_append_entries_response(peer->id_, resp);
+        return;
     }
 
-    handle_append_entries_response(peer->id_, resp);
+    // -----------------------------
+    // Mode B: network-only mode
+    // -----------------------------
+    try {
+        auto resp = transport_->send_append_entries(peer->id_, req);
+        handle_append_entries_response(peer->id_, resp);
+    } catch (const std::exception& ex) {
+        std::cerr << "[RaftNode " << id_
+                  << "] AppendEntries RPC to "
+                  << peer->id_ << " failed: " << ex.what() << "\n";
+    } catch (...) {
+        std::cerr << "[RaftNode " << id_
+                  << "] AppendEntries RPC to "
+                  << peer->id_ << " failed (unknown error)\n";
+    }
 }
 
 

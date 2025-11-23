@@ -53,19 +53,23 @@ struct AppendEntriesResponse {
 };
 
 // ----------------------------------------------------------
-// Network transport interface for Raft RPCs
+// Network transport interface for Raft RPCs (Mode B)
 // ----------------------------------------------------------
 class IRaftTransport {
     public:
-        virtual void send_request_vote(const std::string& target_id,
-                                       const RequestVoteRPC& rpc) = 0;
+        // Send RequestVote to a node identified by target_id and get its response
+        virtual RequestVoteResult send_request_vote(
+            const std::string& target_id,
+            const RequestVoteRPC& rpc) = 0;
     
-        virtual void send_append_entries(const std::string& target_id,
-                                         const AppendEntriesRequest& rpc) = 0;
+        // Send AppendEntries to a node identified by target_id and get its response
+        virtual AppendEntriesResponse send_append_entries(
+            const std::string& target_id,
+            const AppendEntriesRequest& rpc) = 0;
     
         virtual ~IRaftTransport() = default;
     };
-    
+
 class RaftNode {
 public:
     explicit RaftNode(std::string id);
@@ -103,7 +107,13 @@ public:
         return applied_values_;
     }
 
+    // Mode B: network transport + peer ids
     void set_transport(IRaftTransport* t) { transport_ = t; }
+
+    // List of peer node IDs used in network mode; excludes self.
+    void set_peer_ids(const std::vector<std::string>& ids) {
+        peer_ids_ = ids;
+    }
     
 
     // Phase 8: snapshot API
@@ -169,7 +179,12 @@ private:
     void send_append_entries_to_peer(RaftNode* peer);
     void recompute_commit_index();
     void apply_committed();
+    // Mode B: network transport (nullptr in tests)
     IRaftTransport* transport_ = nullptr;
+
+    // Mode B: peer IDs used when transport_ is set
+    std::vector<std::string> peer_ids_;
+
 };
 
 } // namespace nebula

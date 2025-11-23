@@ -72,11 +72,12 @@ public:
     // --------------------------------------------
     // IRaftTransport implementation
     // --------------------------------------------
-    void send_request_vote(const std::string& target_id,
+    RequestVoteResult send_request_vote(const std::string& target_id,
         const RequestVoteRPC& rpc) override;
 
-    void send_append_entries(const std::string& target_id,
-        const AppendEntriesRequest& rpc) override;
+    AppendEntriesResponse send_append_entries(const std::string& target_id,
+                const AppendEntriesRequest& rpc) override;
+
 
 private:
     struct PartitionKey {

@@ -39,15 +39,27 @@ void NebulaNode::start() {
     io_thread_ = std::thread([this]() { run_io(); });
 
     // ---------------------------------------------------------
-    // ADDED: Set the Raft transport (if raft_ exists)
+    // Set the Raft transport (if raft_ exists)
     // ---------------------------------------------------------
     if (raft_) {
         raft_->set_transport(this);   // ADDED
     }
 
     // ---------------------------------------------------------
-    // ADDED: Initialize RaftClients for each peer
-    // Raft port = gossip_port + 1000
+    // Set peer IDs for network Raft elections
+    // ---------------------------------------------------------
+    if (raft_) {
+        std::vector<std::string> peer_ids;
+        for (const auto& p : cfg_.peers) {
+            if (p.id != cfg_.self.id)
+                peer_ids.push_back(p.id);
+        }
+        raft_->set_peer_ids(peer_ids);   // <--- IMPORTANT
+    }
+
+
+    // ---------------------------------------------------------
+    // Initialize RaftClients (network connections)
     // ---------------------------------------------------------
     for (const auto& p : cfg_.peers) {
         if (p.id == cfg_.self.id) continue;
@@ -195,39 +207,57 @@ uint64_t NebulaNode::committed_offset(const std::string& topic,
     return it->second;
 }
 
-// -----------------------------------------------------------
-// ADDED: IRaftTransport implementation
-// -----------------------------------------------------------
-void NebulaNode::send_request_vote(const std::string& target_id,
-                                   const RequestVoteRPC& rpc)
+RequestVoteResult NebulaNode::send_request_vote(const std::string& target_id,
+                                                const RequestVoteRPC& rpc)
 {
     auto it = raft_clients_.find(target_id);
     if (it == raft_clients_.end()) {
-        return;
+        // No connection to that peer; behave as a rejected vote.
+        return RequestVoteResult{ .term = rpc.term, .vote_granted = false };
     }
 
     try {
-        it->second->request_vote(rpc);
+        return it->second->request_vote(rpc);
     } catch (const std::exception& ex) {
         std::cerr << "[NebulaNode] RequestVote RPC to "
                   << target_id << " failed: " << ex.what() << "\n";
+    } catch (...) {
+        std::cerr << "[NebulaNode] RequestVote RPC to "
+                  << target_id << " failed (unknown error)\n";
     }
+
+    return RequestVoteResult{ .term = rpc.term, .vote_granted = false };
 }
 
-void NebulaNode::send_append_entries(const std::string& target_id,
-                                     const AppendEntriesRequest& rpc)
+AppendEntriesResponse NebulaNode::send_append_entries(const std::string& target_id,
+                                                      const AppendEntriesRequest& rpc)
 {
     auto it = raft_clients_.find(target_id);
     if (it == raft_clients_.end()) {
-        return;
+        // Treat as failed replication
+        return AppendEntriesResponse{
+            .term = rpc.term,
+            .success = false,
+            .match_index = static_cast<size_t>(-1)
+        };
     }
 
     try {
-        it->second->append_entries(rpc);
+        return it->second->append_entries(rpc);
     } catch (const std::exception& ex) {
         std::cerr << "[NebulaNode] AppendEntries RPC to "
                   << target_id << " failed: " << ex.what() << "\n";
+    } catch (...) {
+        std::cerr << "[NebulaNode] AppendEntries RPC to "
+                  << target_id << " failed (unknown error)\n";
     }
+
+    return AppendEntriesResponse{
+        .term = rpc.term,
+        .success = false,
+        .match_index = static_cast<size_t>(-1)
+    };
 }
+
 
 }  // namespace nebula

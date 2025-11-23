@@ -162,14 +162,19 @@ AppendEntriesResponse RaftNode::handle_append_entries(const AppendEntriesRequest
         }
     }
 
-    // 4. SAFE commit synchronization (followers never overcommit)
+    // 4. SAFE commit synchronization + apply on followers
     if (req.leader_commit != (size_t)-1) {
-        size_t last_local = log_.empty() ? (size_t)-1 : log_.size() - 1;
 
-        if (req.leader_commit <= last_local) {
-            commit_index_ = req.leader_commit;
+        size_t last_local = log_.empty() ? (size_t)-1 : log_.size() - 1;
+        size_t new_commit = std::min(req.leader_commit, last_local);
+
+        // even if commit_index_ was already bumped by the leader hack,
+        // we still want to apply any newly committed entries
+        if (new_commit > commit_index_) {
+            commit_index_ = new_commit;
         }
-        // else: follower cannot commit entries it does not have
+        // apply all log entries up to commit_index_
+        apply_committed();
     }
 
     size_t match_idx = log_.empty() ? (size_t)-1 : log_.size() - 1;
@@ -224,13 +229,15 @@ void RaftNode::recompute_commit_index() {
             if (kv.second >= idx) replicated++;
         }
 
-        int total = peers_.size() + 1;
+        int total = (int)peers_.size() + 1;
         if (replicated > total / 2) {
             commit_index_ = idx;
         }
     }
-}
 
+    // leader applies any newly committed entries
+    apply_committed();
+}
 
 void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
     size_t next = next_index_[peer->id_];
@@ -270,10 +277,35 @@ void RaftNode::append_client_value(const std::string& value) {
     // Recompute leader commit index based on new match_index_ values
     recompute_commit_index();
 
+    // Propagate committed index to followers that already have the entry
+    if (commit_index_ != static_cast<size_t>(-1)) {
+        for (RaftNode* p : peers_) {
+            if (p->log_.size() > commit_index_) {
+                p->commit_index_ = commit_index_;
+            }
+        }
+    }
+
     // Second round: heartbeat with updated leader_commit
-    // This is what pushes commit_index_ to followers like n2 and n3
     for (RaftNode* p : peers_) {
         send_append_entries_to_peer(p);
+    }
+}
+
+void RaftNode::apply_committed() {
+    if (commit_index_ == static_cast<size_t>(-1))
+        return;
+
+    // start from the first unapplied index
+    size_t start = (last_applied_ == static_cast<size_t>(-1))
+                   ? 0
+                   : last_applied_ + 1;
+
+    if (start > commit_index_) return;
+
+    for (size_t i = start; i <= commit_index_ && i < log_.size(); ++i) {
+        applied_values_.push_back(log_[i].value);
+        last_applied_ = i;
     }
 }
 

@@ -181,3 +181,23 @@ target_link_libraries(test_raft_phase5
         ws2_32
         mswsock
 )
+
+#Test 16 RAFT Log Compaction + Snapshots
+add_executable(test_raft_phase6 tests/test_raft_phase6.cpp)
+target_link_libraries(test_raft_phase6
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+#Test 17 RAFT
+add_executable(test_raft_phase7 tests/test_raft_phase7.cpp)
+target_link_libraries(test_raft_phase7
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)

@@ -56,7 +56,21 @@ void RaftNode::become_candidate() {
     };
 
     for (RaftNode* p : peers_) {
+        // Existing in-memory call (kept for tests)
         auto res = p->handle_request_vote(req);
+
+        // NEW: also send over the network if a transport is set
+        if (transport_) {
+            try {
+                transport_->send_request_vote(p->id_, req);
+            } catch (const std::exception& ex) {
+                std::cerr << "[RaftNode " << id_
+                          << "] failed to send RequestVote to "
+                          << p->id_ << ": " << ex.what() << "\n";
+            } catch (...) {
+                // swallow any weird transport errors, don't kill elections
+            }
+        }
 
         if (res.term > current_term_) {
             become_follower(res.term);
@@ -74,24 +88,36 @@ void RaftNode::become_candidate() {
 
 void RaftNode::become_leader() {
     role_ = RaftRole::Leader;
-    leader_id_ = id_;
+    leader_id_ = id_;  // <- IMPORTANT: leader now knows itself
+
     std::cout << id_ << " is LEADER for term " << current_term_ << "\n";
 
-    size_t next = log_.size();
-    next_index_.clear();
+    // Initialize follower state
     match_index_.clear();
+    next_index_.clear();
+
+    size_t last_index = log_.empty() ? 0 : log_.size();
 
     for (RaftNode* p : peers_) {
-        next_index_[p->id_] = next;
-        match_index_[p->id_] = (size_t)-1;
+        match_index_[p->id_] = static_cast<size_t>(-1);
+        next_index_[p->id_] = last_index;
     }
 
-    match_index_[id_] = log_.empty() ? (size_t)-1 : log_.size() - 1;
+    // Track our own match index
+    if (log_.empty()) {
+        match_index_[id_] = static_cast<size_t>(-1);
+    } else {
+        match_index_[id_] = log_.size() - 1;
+    }
 
+    // Immediately send heartbeats to followers
     for (RaftNode* p : peers_) {
         send_append_entries_to_peer(p);
     }
+
+    last_heartbeat_ = std::chrono::steady_clock::now();
 }
+
 
 RequestVoteResult RaftNode::handle_request_vote(const RequestVoteRPC& req) {
     if (req.term < current_term_) {
@@ -258,9 +284,25 @@ void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
         .leader_commit = commit_index_
     };
 
+    // Existing in-memory call (kept for tests)
     auto resp = peer->handle_append_entries(req);
+
+    // NEW: also send over the network if a transport is set
+    if (transport_) {
+        try {
+            transport_->send_append_entries(peer->id_, req);
+        } catch (const std::exception& ex) {
+            std::cerr << "[RaftNode " << id_
+                      << "] failed to send AppendEntries to "
+                      << peer->id_ << ": " << ex.what() << "\n";
+        } catch (...) {
+            // ignore non-fatal transport issues
+        }
+    }
+
     handle_append_entries_response(peer->id_, resp);
 }
+
 
 void RaftNode::append_client_value(const std::string& value) {
     // Append entry to leader log

@@ -52,6 +52,20 @@ struct AppendEntriesResponse {
     size_t match_index; // highest index that now matches on follower
 };
 
+// ----------------------------------------------------------
+// Network transport interface for Raft RPCs
+// ----------------------------------------------------------
+class IRaftTransport {
+    public:
+        virtual void send_request_vote(const std::string& target_id,
+                                       const RequestVoteRPC& rpc) = 0;
+    
+        virtual void send_append_entries(const std::string& target_id,
+                                         const AppendEntriesRequest& rpc) = 0;
+    
+        virtual ~IRaftTransport() = default;
+    };
+    
 class RaftNode {
 public:
     explicit RaftNode(std::string id);
@@ -88,6 +102,9 @@ public:
     const std::vector<std::string>& applied_values() const {
         return applied_values_;
     }
+
+    void set_transport(IRaftTransport* t) { transport_ = t; }
+    
 
     // Phase 8: snapshot API
     void take_snapshot();
@@ -152,6 +169,7 @@ private:
     void send_append_entries_to_peer(RaftNode* peer);
     void recompute_commit_index();
     void apply_committed();
+    IRaftTransport* transport_ = nullptr;
 };
 
 } // namespace nebula

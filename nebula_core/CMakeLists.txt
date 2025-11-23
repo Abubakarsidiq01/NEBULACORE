@@ -20,6 +20,7 @@ add_library(nebula_core
     src/nebula_node.cpp
     src/node_server.cpp
     src/raft.cpp
+    src/raft_server.cpp
 )
 
 target_include_directories(nebula_core PUBLIC src)
@@ -205,6 +206,16 @@ target_link_libraries(test_raft_phase7
 #Test 18 RAFT Snapshot + Installation
 add_executable(test_raft_phase8 tests/test_raft_phase8.cpp)
 target_link_libraries(test_raft_phase8
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)
+
+#Test 19 RAFT Network Basic Test
+add_executable(test_raft_network_basic tests/test_raft_network_basic.cpp)
+target_link_libraries(test_raft_network_basic
     PRIVATE
         nebula_core
         Boost::system

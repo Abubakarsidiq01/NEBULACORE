@@ -159,4 +159,111 @@ void NebulaWireClient::publish(const std::string& payload) {
     }
 }
 
-}  // namespace nebula
+// -------- Raft wire encode/decode helpers --------
+
+namespace {
+
+// simple big-endian helpers for our Raft wire format
+
+inline void nb_append_u8(std::vector<uint8_t>& out, uint8_t v) {
+    out.push_back(v);
+}
+
+inline void nb_append_u32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+inline void nb_append_u64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 7; i >= 0; --i) {
+        out.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+    }
+}
+
+inline void nb_append_i64(std::vector<uint8_t>& out, int64_t v) {
+    nb_append_u64(out, static_cast<uint64_t>(v));
+}
+
+inline bool nb_read_u8(const std::vector<uint8_t>& buf, std::size_t& off, uint8_t& v) {
+    if (off + 1 > buf.size()) return false;
+    v = buf[off++];
+    return true;
+}
+
+inline bool nb_read_u32(const std::vector<uint8_t>& buf, std::size_t& off, uint32_t& v) {
+    if (off + 4 > buf.size()) return false;
+    v = 0;
+    for (int i = 0; i < 4; ++i) {
+        v = (v << 8) | buf[off++];
+    }
+    return true;
+}
+
+inline bool nb_read_u64(const std::vector<uint8_t>& buf, std::size_t& off, uint64_t& v) {
+    if (off + 8 > buf.size()) return false;
+    v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v = (v << 8) | buf[off++];
+    }
+    return true;
+}
+
+inline bool nb_read_i64(const std::vector<uint8_t>& buf, std::size_t& off, int64_t& v) {
+    uint64_t tmp = 0;
+    if (!nb_read_u64(buf, off, tmp)) return false;
+    v = static_cast<int64_t>(tmp);
+    return true;
+}
+
+} // namespace
+
+void encode_append_entries_request(const RaftAppendEntriesRequestWire& r,
+                                   std::vector<uint8_t>& out) {
+    out.clear();
+    nb_append_u64(out, r.term);
+    nb_append_u32(out, r.leader_id);
+    nb_append_u64(out, r.prev_log_index);
+    nb_append_u64(out, r.prev_log_term);
+    nb_append_u64(out, r.leader_commit);
+
+    nb_append_u32(out, static_cast<uint32_t>(r.entries.size()));
+    for (const auto& e : r.entries) {
+        nb_append_u64(out, e.index);
+        nb_append_u64(out, e.term);
+        nb_append_i64(out, e.value);
+    }
+}
+
+bool decode_append_entries_request(const std::vector<uint8_t>& buf,
+    RaftAppendEntriesRequestWire& r) {
+std::size_t off = 0;
+
+if (!nb_read_u64(buf, off, r.term)) return false;
+
+uint32_t leader_id = 0;
+if (!nb_read_u32(buf, off, leader_id)) return false;
+r.leader_id = leader_id;
+
+if (!nb_read_u64(buf, off, r.prev_log_index)) return false;
+if (!nb_read_u64(buf, off, r.prev_log_term)) return false;
+if (!nb_read_u64(buf, off, r.leader_commit)) return false;
+
+uint32_t count = 0;
+if (!nb_read_u32(buf, off, count)) return false;
+
+r.entries.clear();
+r.entries.resize(count);
+
+for (uint32_t i = 0; i < count; i++) {
+if (!nb_read_u64(buf, off, r.entries[i].index)) return false;
+if (!nb_read_u64(buf, off, r.entries[i].term)) return false;
+if (!nb_read_i64(buf, off, r.entries[i].value)) return false;
+}
+
+return true;
+}
+
+} // namespace nebula
+

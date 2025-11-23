@@ -15,7 +15,7 @@ NebulaNode::NebulaNode(const NebulaNodeConfig& cfg)
       io_() {
 
     fs::create_directories(cfg_.data_root);
-
+    
     topics_ = std::make_unique<TopicManager>(cfg_.data_root);
     cluster_ = std::make_unique<GossipCluster>(io_, cfg_.self, cfg_.peers);
     elector_ = std::make_unique<LeaderElector>(io_, *cluster_, cfg_.self.id);
@@ -37,6 +37,33 @@ void NebulaNode::start() {
     elector_->start();
 
     io_thread_ = std::thread([this]() { run_io(); });
+
+    // ---------------------------------------------------------
+    // ADDED: Set the Raft transport (if raft_ exists)
+    // ---------------------------------------------------------
+    if (raft_) {
+        raft_->set_transport(this);   // ADDED
+    }
+
+    // ---------------------------------------------------------
+    // ADDED: Initialize RaftClients for each peer
+    // Raft port = gossip_port + 1000
+    // ---------------------------------------------------------
+    for (const auto& p : cfg_.peers) {
+        if (p.id == cfg_.self.id) continue;
+
+        uint16_t raft_port = p.gossip_port + 1000;
+
+        try {
+            raft_clients_[p.id] = std::make_unique<RaftClient>(p.host, raft_port);
+            std::cout << "[NebulaNode] Connected RaftClient to "
+                      << p.id << " at " << p.host
+                      << ":" << raft_port << "\n";
+        } catch (const std::exception& ex) {
+            std::cerr << "[NebulaNode] Failed RaftClient to "
+                      << p.id << ": " << ex.what() << "\n";
+        }
+    }
 }
 
 void NebulaNode::stop() {
@@ -116,7 +143,6 @@ std::pair<std::size_t, uint64_t> NebulaNode::publish(
         if (!peer) continue;
         try {
             auto peer_res = peer->replicate_publish(topic, key, payload);
-            // peer_res.first should equal partition_index if your hashing is deterministic
             follower_offsets.push_back(peer_res.second);
         } catch (const std::exception& ex) {
             std::cerr << "Replication failed on peer: " << ex.what() << "\n";
@@ -124,8 +150,6 @@ std::pair<std::size_t, uint64_t> NebulaNode::publish(
     }
 
     // Now compute commit index for this partition.
-    // We have one local offset and N follower offsets.
-    // Total nodes = 1 leader + follower_offsets.size()
     const std::size_t total_nodes = follower_offsets.size() + 1;
     const std::size_t quorum = (total_nodes / 2) + 1;
 
@@ -138,7 +162,6 @@ std::pair<std::size_t, uint64_t> NebulaNode::publish(
     }
     std::sort(all_offsets.begin(), all_offsets.end());
 
-    // Commit index is the value at position quorum minus one
     uint64_t new_commit = all_offsets[quorum - 1];
 
     PartitionKey key_partition{topic, partition_index};
@@ -170,6 +193,41 @@ uint64_t NebulaNode::committed_offset(const std::string& topic,
         return 0;
     }
     return it->second;
+}
+
+// -----------------------------------------------------------
+// ADDED: IRaftTransport implementation
+// -----------------------------------------------------------
+void NebulaNode::send_request_vote(const std::string& target_id,
+                                   const RequestVoteRPC& rpc)
+{
+    auto it = raft_clients_.find(target_id);
+    if (it == raft_clients_.end()) {
+        return;
+    }
+
+    try {
+        it->second->request_vote(rpc);
+    } catch (const std::exception& ex) {
+        std::cerr << "[NebulaNode] RequestVote RPC to "
+                  << target_id << " failed: " << ex.what() << "\n";
+    }
+}
+
+void NebulaNode::send_append_entries(const std::string& target_id,
+                                     const AppendEntriesRequest& rpc)
+{
+    auto it = raft_clients_.find(target_id);
+    if (it == raft_clients_.end()) {
+        return;
+    }
+
+    try {
+        it->second->append_entries(rpc);
+    } catch (const std::exception& ex) {
+        std::cerr << "[NebulaNode] AppendEntries RPC to "
+                  << target_id << " failed: " << ex.what() << "\n";
+    }
 }
 
 }  // namespace nebula

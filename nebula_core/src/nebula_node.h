@@ -11,10 +11,11 @@
 #include <unordered_map>
 #include <functional>
 
-
 #include "cluster.h"
 #include "leader.h"
 #include "topic_manager.h"
+#include "raft.h"
+#include "raft_server.h"
 
 namespace nebula {
 
@@ -25,7 +26,7 @@ struct NebulaNodeConfig {
     std::size_t default_partitions{3};
 };
 
-class NebulaNode {
+class NebulaNode : public IRaftTransport {
 public:
     explicit NebulaNode(const NebulaNodeConfig& cfg);
 
@@ -62,6 +63,21 @@ public:
 
     const NebulaNodeConfig& config() const { return cfg_; }
 
+    // --------------------------------------------------------------------
+    // *** Public Raft integration so tests & networking setup can access ***
+    // --------------------------------------------------------------------
+    std::unique_ptr<RaftNode> raft_;          // now PUBLIC
+    std::unique_ptr<RaftServer> raft_server_; // now PUBLIC
+
+    // --------------------------------------------
+    // IRaftTransport implementation
+    // --------------------------------------------
+    void send_request_vote(const std::string& target_id,
+        const RequestVoteRPC& rpc) override;
+
+    void send_append_entries(const std::string& target_id,
+        const AppendEntriesRequest& rpc) override;
+
 private:
     struct PartitionKey {
         std::string topic;
@@ -97,6 +113,9 @@ private:
 
     // Per partition commit index, only meaningful on leader
     std::unordered_map<PartitionKey, uint64_t, PartitionKeyHash> commit_index_;
+
+    std::unordered_map<std::string, std::unique_ptr<RaftClient>> raft_clients_;
+
 
     void run_io();
 };

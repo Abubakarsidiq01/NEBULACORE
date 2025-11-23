@@ -89,6 +89,17 @@ public:
         return applied_values_;
     }
 
+    // Phase 8: snapshot API
+    void take_snapshot();
+    void install_snapshot(size_t index, int term,
+                          const std::vector<std::string>& state);
+
+    size_t snapshot_index() const { return snapshot_index_; }
+    int snapshot_term() const { return snapshot_term_; }
+    const std::vector<std::string>& snapshot_state() const {
+        return snapshot_state_;
+    }
+
 private:
     std::string id_;
 
@@ -117,6 +128,11 @@ private:
 
     std::vector<RaftNode*> peers_;
     int votes_received_ = 0;
+
+    // Phase 8: snapshot metadata
+    size_t snapshot_index_ = static_cast<size_t>(-1);
+    int snapshot_term_ = 0;
+    std::vector<std::string> snapshot_state_;
 
     int random_timeout_ms();
 

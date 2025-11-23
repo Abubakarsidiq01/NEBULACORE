@@ -201,3 +201,13 @@ target_link_libraries(test_raft_phase7
         ws2_32
         mswsock
 )
+
+#Test 18 RAFT Snapshot + Installation
+add_executable(test_raft_phase8 tests/test_raft_phase8.cpp)
+target_link_libraries(test_raft_phase8
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)

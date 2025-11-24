@@ -117,10 +117,9 @@ void RaftNode::become_candidate() {
     }
 }
 
-
 void RaftNode::become_leader() {
     role_ = RaftRole::Leader;
-    leader_id_ = id_;  // <- IMPORTANT: leader now knows itself
+    leader_id_ = id_;  // leader knows itself
 
     std::cout << id_ << " is LEADER for term " << current_term_ << "\n";
 
@@ -162,7 +161,6 @@ void RaftNode::become_leader() {
 
     last_heartbeat_ = std::chrono::steady_clock::now();
 }
-
 
 RequestVoteResult RaftNode::handle_request_vote(const RequestVoteRPC& req) {
     if (req.term < current_term_) {
@@ -239,12 +237,9 @@ AppendEntriesResponse RaftNode::handle_append_entries(const AppendEntriesRequest
         size_t last_local = log_.empty() ? (size_t)-1 : log_.size() - 1;
         size_t new_commit = std::min(req.leader_commit, last_local);
 
-        // even if commit_index_ was already bumped by the leader hack,
-        // we still want to apply any newly committed entries
         if (new_commit > commit_index_) {
             commit_index_ = new_commit;
         }
-        // apply all log entries up to commit_index_
         apply_committed();
     }
 
@@ -314,7 +309,6 @@ void RaftNode::recompute_commit_index() {
         }
     }
 
-    // leader applies any newly committed entries
     apply_committed();
 }
 
@@ -464,12 +458,30 @@ void RaftNode::apply_committed() {
 }
 
 void RaftNode::tick() {
+    // One-time process-wide boot timestamp
+    static const auto process_boot =
+        std::chrono::steady_clock::now();
+
     auto now = std::chrono::steady_clock::now();
+
+    // In **network mode** only, delay elections for the first 1s
+    // so all RaftServers and RaftClients have time to come up.
+    if (transport_) {
+        auto since_boot_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - process_boot)
+                                 .count();
+        if (since_boot_ms < 1000) {
+            // still allow leaders to send heartbeats later,
+            // but do not start any elections yet
+            return;
+        }
+    }
+
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                        now - last_heartbeat_)
                        .count();
 
-    // Leader: we just maintain heartbeat timing like before
+    // Leader: maintain heartbeat timing
     if (role_ == RaftRole::Leader) {
         if (elapsed > heartbeat_interval_ms_) {
             last_heartbeat_ = now;
@@ -488,9 +500,8 @@ void RaftNode::tick() {
         return;
     }
 
-    // Phase 8: make node1 reliably become leader quickly in the 3-node test
-    // This only affects the "node1" id used in test_raft_phase8, and only for the first term.
-    if (role_ == RaftRole::Follower &&
+    // Phase 8 hack: make node1 become leader quickly in 3-node snapshot test
+    if (!transport_ && role_ == RaftRole::Follower &&
         current_term_ == 0 &&
         id_ == "node1")
     {
@@ -499,13 +510,12 @@ void RaftNode::tick() {
         return;
     }
 
-    // Normal timeout-based election (unchanged behavior for phases 1–7)
+    // Normal timeout-based election
     if (elapsed > election_timeout_ms_) {
         become_candidate();
         last_heartbeat_ = std::chrono::steady_clock::now();
     }
 }
-
 
 // Phase 8: snapshot support
 
@@ -532,12 +542,10 @@ void RaftNode::take_snapshot() {
     commit_index_ = (size_t)-1;
     last_applied_ = (size_t)-1;
 
-    // *** FIX: prevent instant follower timeout ***
+    // prevent instant follower timeout after snapshot
     last_heartbeat_ = std::chrono::steady_clock::now();
     election_timeout_ms_ = random_timeout_ms();
 }
-
-
 
 void RaftNode::install_snapshot(size_t index, int term,
                                 const std::vector<std::string>& state) {

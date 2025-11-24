@@ -66,13 +66,10 @@ private:
 /**
  * RaftClient
  *
- * Simple synchronous client for sending Raft RPCs to a remote RaftServer.
- * Creates a new TCP connection per client instance.
- *
- * Usage:
- *   RaftClient c("127.0.0.1", 6001);
- *   RequestVoteResult res = c.request_vote(req);
- *   AppendEntriesResponse ar = c.append_entries(ae);
+ * Synchronous client for sending Raft RPCs to a remote RaftServer.
+ * This version is resilient:
+ *  - remembers host/port
+ *  - reconnects lazily if socket is closed or broken
  */
 class RaftClient {
 public:
@@ -85,8 +82,19 @@ public:
     AppendEntriesResponse append_entries(const AppendEntriesRequest& req);
 
 private:
+    using tcp = boost::asio::ip::tcp;
+
+    std::string host_;
+    uint16_t port_;
+
     boost::asio::io_context io_;
-    boost::asio::ip::tcp::socket socket_;
+    tcp::socket socket_;
+
+    // Ensure we have a connected socket. If not, resolve+connect.
+    void ensure_connected();
+
+    // Close socket on error so next call will reconnect.
+    void close_socket();
 };
 
 } // namespace nebula

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <vector>
 #include <cstring>
+#include <stdexcept>
 
 #include "raft.h"
 
@@ -395,21 +396,44 @@ void RaftServer::do_accept() {
 // ----------------- RaftClient implementation --------------------
 
 RaftClient::RaftClient(const std::string& host, uint16_t port)
-    : io_(),
+    : host_(host),
+      port_(port),
+      io_(),
       socket_(io_) {
-    boost::system::error_code ec;
-    tcp::resolver resolver(io_);
-    auto endpoints = resolver.resolve(host, std::to_string(port), ec);
-    if (ec) {
-        throw std::runtime_error("RaftClient resolve error: " + ec.message());
-    }
-    boost::asio::connect(socket_, endpoints, ec);
-    if (ec) {
-        throw std::runtime_error("RaftClient connect error: " + ec.message());
+    // Do not connect immediately; connect lazily on first RPC.
+}
+
+void RaftClient::close_socket() {
+    if (socket_.is_open()) {
+        boost::system::error_code ec;
+        socket_.close(ec);
     }
 }
 
+void RaftClient::ensure_connected() {
+    if (socket_.is_open()) {
+        return;
+    }
+
+    boost::system::error_code ec;
+    tcp::resolver resolver(io_);
+    auto endpoints = resolver.resolve(host_, std::to_string(port_), ec);
+    if (ec) {
+        throw std::runtime_error("RaftClient resolve error: " + ec.message());
+    }
+
+    tcp::socket new_socket(io_);
+    boost::asio::connect(new_socket, endpoints, ec);
+    if (ec) {
+        throw std::runtime_error("RaftClient connect error: " + ec.message());
+    }
+
+    socket_ = std::move(new_socket);
+}
+
 RequestVoteResult RaftClient::request_vote(const RequestVoteRPC& req) {
+    ensure_connected();
+
     std::vector<char> payload;
     payload.push_back(static_cast<char>(RaftRpcType::RequestVote));
     write_u64_be(req.term, payload);
@@ -425,20 +449,37 @@ RequestVoteResult RaftClient::request_vote(const RequestVoteRPC& req) {
     write_u32_be(static_cast<uint32_t>(payload.size()), frame);
     frame.insert(frame.end(), payload.begin(), payload.end());
 
-    boost::asio::write(socket_, boost::asio::buffer(frame));
+    boost::system::error_code ec;
+
+    boost::asio::write(socket_, boost::asio::buffer(frame), ec);
+    if (ec) {
+        close_socket();
+        throw std::runtime_error("RaftClient RequestVote write error: " + ec.message());
+    }
 
     // read response header
     char hdr[4];
-    boost::asio::read(socket_, boost::asio::buffer(hdr, 4));
+    boost::asio::read(socket_, boost::asio::buffer(hdr, 4), ec);
+    if (ec) {
+        close_socket();
+        throw std::runtime_error("RaftClient RequestVote read header error: " + ec.message());
+    }
+
     uint32_t len = read_u32_be(hdr);
     std::vector<char> resp(len);
-    boost::asio::read(socket_, boost::asio::buffer(resp.data(), resp.size()));
+    boost::asio::read(socket_, boost::asio::buffer(resp.data(), resp.size()), ec);
+    if (ec) {
+        close_socket();
+        throw std::runtime_error("RaftClient RequestVote read body error: " + ec.message());
+    }
 
     if (resp.empty() || resp[0] != static_cast<char>(RaftRpcType::RequestVote)) {
+        close_socket();
         throw std::runtime_error("RaftClient: bad RequestVote response");
     }
 
     if (resp.size() < 1 + 8 + 1) {
+        close_socket();
         throw std::runtime_error("RaftClient: short RequestVote response");
     }
 
@@ -454,6 +495,8 @@ RequestVoteResult RaftClient::request_vote(const RequestVoteRPC& req) {
 }
 
 AppendEntriesResponse RaftClient::append_entries(const AppendEntriesRequest& req) {
+    ensure_connected();
+
     std::vector<char> payload;
     payload.push_back(static_cast<char>(RaftRpcType::AppendEntries));
 
@@ -488,20 +531,37 @@ AppendEntriesResponse RaftClient::append_entries(const AppendEntriesRequest& req
     write_u32_be(static_cast<uint32_t>(payload.size()), frame);
     frame.insert(frame.end(), payload.begin(), payload.end());
 
-    boost::asio::write(socket_, boost::asio::buffer(frame));
+    boost::system::error_code ec;
+
+    boost::asio::write(socket_, boost::asio::buffer(frame), ec);
+    if (ec) {
+        close_socket();
+        throw std::runtime_error("RaftClient AppendEntries write error: " + ec.message());
+    }
 
     // read response header
     char hdr[4];
-    boost::asio::read(socket_, boost::asio::buffer(hdr, 4));
+    boost::asio::read(socket_, boost::asio::buffer(hdr, 4), ec);
+    if (ec) {
+        close_socket();
+        throw std::runtime_error("RaftClient AppendEntries read header error: " + ec.message());
+    }
+
     uint32_t len = read_u32_be(hdr);
     std::vector<char> resp(len);
-    boost::asio::read(socket_, boost::asio::buffer(resp.data(), resp.size()));
+    boost::asio::read(socket_, boost::asio::buffer(resp.data(), resp.size()), ec);
+    if (ec) {
+        close_socket();
+        throw std::runtime_error("RaftClient AppendEntries read body error: " + ec.message());
+    }
 
     if (resp.empty() || resp[0] != static_cast<char>(RaftRpcType::AppendEntries)) {
+        close_socket();
         throw std::runtime_error("RaftClient: bad AppendEntries response");
     }
 
     if (resp.size() < 1 + 8 + 1 + 8) {
+        close_socket();
         throw std::runtime_error("RaftClient: short AppendEntries response");
     }
 

@@ -26,7 +26,7 @@ struct NebulaNodeConfig {
     std::size_t default_partitions{3};
 };
 
-class NebulaNode : public IRaftTransport {
+class NebulaNode : public IRaftStateMachine, public IRaftTransport {
 public:
     explicit NebulaNode(const NebulaNodeConfig& cfg);
 
@@ -77,6 +77,9 @@ public:
 
     AppendEntriesResponse send_append_entries(const std::string& target_id,
                 const AppendEntriesRequest& rpc) override;
+
+    // IRaftStateMachine implementation: apply a committed Raft command.
+    void apply(const std::string& command) override;
 
 
 private:

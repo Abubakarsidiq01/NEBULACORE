@@ -444,15 +444,23 @@ void RaftNode::apply_committed() {
     if (commit_index_ == static_cast<size_t>(-1))
         return;
 
-    // start from the first unapplied index
     size_t start = (last_applied_ == static_cast<size_t>(-1))
                    ? 0
                    : last_applied_ + 1;
 
-    if (start > commit_index_) return;
+    if (start > commit_index_)
+        return;
 
     for (size_t i = start; i <= commit_index_ && i < log_.size(); ++i) {
+
+        // Keep old test behavior
         applied_values_.push_back(log_[i].value);
+
+        // NEW: drive NebulaNode state machine (publish_from_raft)
+        if (state_machine_) {
+            state_machine_->apply(log_[i].value);
+        }
+
         last_applied_ = i;
     }
 }

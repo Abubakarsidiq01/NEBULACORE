@@ -17,6 +17,19 @@ void TopicManager::create_topic(const TopicConfig& cfg) {
     get_or_create_topic(cfg);
 }
 
+void TopicManager::publish_from_raft(const std::string& topic,
+                                     const std::string& key,
+                                     const std::string& payload) {
+    // Use the same default topic config as publish() (3 partitions).
+    TopicConfig cfg{topic, 3};
+    create_topic(cfg);
+
+    // Append locally. This does not perform any cross-node replication
+    // and does not talk to Raft; it is only called after a Raft log
+    // entry has already been committed.
+    (void)publish(topic, key, payload);
+}
+
 TopicManager::TopicState& TopicManager::get_or_create_topic(const TopicConfig& cfg) {
     auto it = topics_.find(cfg.name);
     if (it != topics_.end()) {
@@ -34,14 +47,17 @@ TopicManager::TopicState& TopicManager::get_or_create_topic(const TopicConfig& c
         log_cfg.directory = dir;
         log_cfg.base_filename = "segment_00000000.log";
 
-        state.partitions[i].log = std::make_unique<NebulaLog>(log_cfg);
+        PartitionState part;
+        part.log = std::make_unique<NebulaLog>(log_cfg);
+        state.partitions[i] = std::move(part);
     }
 
     auto [insert_it, _] = topics_.emplace(cfg.name, std::move(state));
     return insert_it->second;
 }
 
-std::size_t TopicManager::choose_partition(const std::string& key, std::size_t num_partitions) const {
+std::size_t TopicManager::choose_partition(const std::string& key,
+                                           std::size_t num_partitions) const {
     if (num_partitions == 0) {
         throw std::runtime_error("No partitions configured");
     }

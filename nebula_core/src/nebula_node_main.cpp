@@ -121,6 +121,8 @@ int main(int argc, char** argv) {
 
     // Wire RaftNode for this process
     node.raft_ = std::make_unique<RaftNode>(cfg.self.id);
+    node.raft_->set_state_machine(&node);
+
 
     // Mode B: set peer IDs based on config
     {
@@ -153,6 +155,19 @@ int main(int argc, char** argv) {
     // Now start NebulaNode gossip cluster and RaftClients
     std::cout << "[NebulaNode " << cfg.self.id << "] starting NebulaNode core\n";
     node.start();
+
+    if (cfg.self.id == "n1") {
+        std::thread([&]() {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            std::cout << "\n[PUBLISH TEST] Publishing test message...\n";
+            try {
+                node.publish("alerts", "k1", "hello world from raft");
+            } catch (const std::exception& ex) {
+                std::cerr << "[PUBLISH ERROR] " << ex.what() << "\n";
+            }
+        }).detach();
+    }
+    
 
     if (!node.raft_) {
         std::cerr << "Raft node was not created, exiting\n";

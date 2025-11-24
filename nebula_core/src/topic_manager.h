@@ -30,18 +30,22 @@ public:
         const std::string& key,
         const std::string& payload);
 
-    // Read next message for a given consumer group on a specific partition.
-    // Returns empty optional if there is nothing new.
+    // Read next message for a given consumer group and partition.
     std::optional<std::string> read_next(
         const std::string& topic,
         const std::string& consumer_group,
         std::size_t partition_index);
 
-    // For tests and introspection: get current offset for group and partition.
+    // Get current offset for a given consumer group and partition.
     std::optional<uint64_t> current_offset(
         const std::string& topic,
         const std::string& consumer_group,
         std::size_t partition_index) const;
+
+    // Publish from Raft state machine (no return value, just append)
+    void publish_from_raft(const std::string& topic,
+                           const std::string& key,
+                           const std::string& payload);
 
 private:
     struct PartitionState {

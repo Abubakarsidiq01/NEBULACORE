@@ -69,6 +69,11 @@ public:
 
     virtual ~IRaftTransport() = default;
 };
+class IRaftStateMachine {
+public:
+    virtual ~IRaftStateMachine() {}
+    virtual void apply(const std::string& command) = 0;
+};
 
 class RaftNode {
 public:
@@ -109,6 +114,10 @@ public:
 
     // Mode B: network transport + peer ids
     void set_transport(IRaftTransport* t) { transport_ = t; }
+
+    // Optional state machine that will be driven by committed log entries.
+    void set_state_machine(IRaftStateMachine* sm) { state_machine_ = sm; }
+
 
     // List of peer node IDs used in network mode; excludes self.
     void set_peer_ids(const std::vector<std::string>& ids) {
@@ -189,6 +198,10 @@ private:
 
     // Mode B: peer IDs used when transport_ is set
     std::vector<std::string> peer_ids_;
+
+    // Optional external state machine (NebulaNode) to apply committed commands.
+    IRaftStateMachine* state_machine_ = nullptr;
+
     
 };
 

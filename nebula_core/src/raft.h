@@ -56,19 +56,19 @@ struct AppendEntriesResponse {
 // Network transport interface for Raft RPCs (Mode B)
 // ----------------------------------------------------------
 class IRaftTransport {
-    public:
-        // Send RequestVote to a node identified by target_id and get its response
-        virtual RequestVoteResult send_request_vote(
-            const std::string& target_id,
-            const RequestVoteRPC& rpc) = 0;
-    
-        // Send AppendEntries to a node identified by target_id and get its response
-        virtual AppendEntriesResponse send_append_entries(
-            const std::string& target_id,
-            const AppendEntriesRequest& rpc) = 0;
-    
-        virtual ~IRaftTransport() = default;
-    };
+public:
+    // Send RequestVote to a node identified by target_id and get its response
+    virtual RequestVoteResult send_request_vote(
+        const std::string& target_id,
+        const RequestVoteRPC& rpc) = 0;
+
+    // Send AppendEntries to a node identified by target_id and get its response
+    virtual AppendEntriesResponse send_append_entries(
+        const std::string& target_id,
+        const AppendEntriesRequest& rpc) = 0;
+
+    virtual ~IRaftTransport() = default;
+};
 
 class RaftNode {
 public:
@@ -114,7 +114,6 @@ public:
     void set_peer_ids(const std::vector<std::string>& ids) {
         peer_ids_ = ids;
     }
-    
 
     // Phase 8: snapshot API
     void take_snapshot();
@@ -176,15 +175,21 @@ private:
     bool is_log_up_to_date(uint64_t other_last_index,
                            uint64_t other_last_term) const;
 
+    // Mode A: in-process peers
     void send_append_entries_to_peer(RaftNode* peer);
+
+    // Mode B: network peers by ID
+    void send_append_entries_to_peer(const std::string& peer_id);
+
     void recompute_commit_index();
     void apply_committed();
+
     // Mode B: network transport (nullptr in tests)
     IRaftTransport* transport_ = nullptr;
 
     // Mode B: peer IDs used when transport_ is set
     std::vector<std::string> peer_ids_;
-
+    
 };
 
 } // namespace nebula

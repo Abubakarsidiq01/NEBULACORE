@@ -222,3 +222,18 @@ target_link_libraries(test_raft_network_basic
         ws2_32
         mswsock
 )
+
+# -------------------------------------------------------------------
+# NEBULA NODE MAIN (Real Multi-Process Raft Cluster Entry Point)
+# -------------------------------------------------------------------
+add_executable(nebula_node_main
+    src/nebula_node_main.cpp
+)
+
+target_link_libraries(nebula_node_main
+    PRIVATE
+        nebula_core
+        Boost::system
+        ws2_32
+        mswsock
+)

@@ -130,9 +130,16 @@ void RaftNode::become_leader() {
 
     size_t last_index = log_.empty() ? 0 : log_.size();
 
+    // Mode A: in-process peers
     for (RaftNode* p : peers_) {
         match_index_[p->id_] = static_cast<size_t>(-1);
         next_index_[p->id_] = last_index;
+    }
+
+    // Mode B: network peers by ID
+    for (const auto& pid : peer_ids_) {
+        match_index_[pid] = static_cast<size_t>(-1);
+        next_index_[pid] = last_index;
     }
 
     // Track our own match index
@@ -143,8 +150,14 @@ void RaftNode::become_leader() {
     }
 
     // Immediately send heartbeats to followers
-    for (RaftNode* p : peers_) {
-        send_append_entries_to_peer(p);
+    if (!peers_.empty()) {
+        for (RaftNode* p : peers_) {
+            send_append_entries_to_peer(p);
+        }
+    } else if (transport_ && !peer_ids_.empty()) {
+        for (const auto& pid : peer_ids_) {
+            send_append_entries_to_peer(pid);
+        }
     }
 
     last_heartbeat_ = std::chrono::steady_clock::now();
@@ -287,7 +300,15 @@ void RaftNode::recompute_commit_index() {
             if (kv.second >= idx) replicated++;
         }
 
-        int total = (int)peers_.size() + 1;
+        int total = 0;
+        if (transport_ && peers_.empty()) {
+            // network mode: use peer_ids_
+            total = static_cast<int>(peer_ids_.size()) + 1;
+        } else {
+            // in-memory mode: use peers_
+            total = static_cast<int>(peers_.size()) + 1;
+        }
+
         if (replicated > total / 2) {
             commit_index_ = idx;
         }
@@ -297,6 +318,9 @@ void RaftNode::recompute_commit_index() {
     apply_committed();
 }
 
+// -------------------------
+// Mode A: in-process peers
+// -------------------------
 void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
     size_t next = next_index_[peer->id_];
 
@@ -326,7 +350,7 @@ void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
     }
 
     // -----------------------------
-    // Mode B: network-only mode
+    // Mode B but with peers_ (not used in NebulaCore)
     // -----------------------------
     try {
         auto resp = transport_->send_append_entries(peer->id_, req);
@@ -342,6 +366,43 @@ void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
     }
 }
 
+// -------------------------
+// Mode B: network peers by ID
+// -------------------------
+void RaftNode::send_append_entries_to_peer(const std::string& peer_id) {
+    if (!transport_) return; // nothing to do in pure test mode
+
+    size_t next = next_index_[peer_id];
+
+    size_t prev_idx = next == 0 ? (size_t)-1 : next - 1;
+    int prev_term = prev_idx == (size_t)-1 ? 0 : log_[prev_idx].term;
+
+    std::vector<LogEntry> entries;
+    for (size_t i = next; i < log_.size(); ++i)
+        entries.push_back(log_[i]);
+
+    AppendEntriesRequest req{
+        .leader_id = id_,
+        .term = static_cast<int>(current_term_),
+        .prev_log_index = prev_idx,
+        .prev_log_term = prev_term,
+        .entries = std::move(entries),
+        .leader_commit = commit_index_
+    };
+
+    try {
+        auto resp = transport_->send_append_entries(peer_id, req);
+        handle_append_entries_response(peer_id, resp);
+    } catch (const std::exception& ex) {
+        std::cerr << "[RaftNode " << id_
+                  << "] AppendEntries RPC to "
+                  << peer_id << " failed: " << ex.what() << "\n";
+    } catch (...) {
+        std::cerr << "[RaftNode " << id_
+                  << "] AppendEntries RPC to "
+                  << peer_id << " failed (unknown error)\n";
+    }
+}
 
 void RaftNode::append_client_value(const std::string& value) {
     // Append entry to leader log
@@ -351,8 +412,14 @@ void RaftNode::append_client_value(const std::string& value) {
     match_index_[id_] = log_.size() - 1;
 
     // First round: replicate the new entry to all followers
-    for (RaftNode* p : peers_) {
-        send_append_entries_to_peer(p);
+    if (!peers_.empty()) {
+        for (RaftNode* p : peers_) {
+            send_append_entries_to_peer(p);
+        }
+    } else if (transport_ && !peer_ids_.empty()) {
+        for (const auto& pid : peer_ids_) {
+            send_append_entries_to_peer(pid);
+        }
     }
 
     // Recompute leader commit index based on new match_index_ values
@@ -368,8 +435,14 @@ void RaftNode::append_client_value(const std::string& value) {
     }
 
     // Second round: heartbeat with updated leader_commit
-    for (RaftNode* p : peers_) {
-        send_append_entries_to_peer(p);
+    if (!peers_.empty()) {
+        for (RaftNode* p : peers_) {
+            send_append_entries_to_peer(p);
+        }
+    } else if (transport_ && !peer_ids_.empty()) {
+        for (const auto& pid : peer_ids_) {
+            send_append_entries_to_peer(pid);
+        }
     }
 }
 
@@ -398,8 +471,20 @@ void RaftNode::tick() {
 
     // Leader: we just maintain heartbeat timing like before
     if (role_ == RaftRole::Leader) {
-        if (elapsed > heartbeat_interval_ms_)
+        if (elapsed > heartbeat_interval_ms_) {
             last_heartbeat_ = now;
+
+            // send periodic heartbeats
+            if (!peers_.empty()) {
+                for (RaftNode* p : peers_) {
+                    send_append_entries_to_peer(p);
+                }
+            } else if (transport_ && !peer_ids_.empty()) {
+                for (const auto& pid : peer_ids_) {
+                    send_append_entries_to_peer(pid);
+                }
+            }
+        }
         return;
     }
 

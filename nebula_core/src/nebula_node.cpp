@@ -16,7 +16,7 @@ NebulaNode::NebulaNode(const NebulaNodeConfig& cfg)
       io_() {
 
     fs::create_directories(cfg_.data_root);
-    
+
     topics_ = std::make_unique<TopicManager>(cfg_.data_root);
     cluster_ = std::make_unique<GossipCluster>(io_, cfg_.self, cfg_.peers);
     elector_ = std::make_unique<LeaderElector>(io_, *cluster_, cfg_.self.id);
@@ -56,9 +56,8 @@ void NebulaNode::start() {
             if (p.id != cfg_.self.id)
                 peer_ids.push_back(p.id);
         }
-        raft_->set_peer_ids(peer_ids);   // <--- IMPORTANT
+        raft_->set_peer_ids(peer_ids);
     }
-
 
     // ---------------------------------------------------------
     // Initialize RaftClients (network connections)
@@ -78,6 +77,7 @@ void NebulaNode::start() {
                       << p.id << ": " << ex.what() << "\n";
         }
     }
+    
 }
 
 void NebulaNode::stop() {
@@ -95,12 +95,49 @@ void NebulaNode::stop() {
     }
 }
 
+// IMPORTANT: when Raft is wired, this is the Raft leader, not gossip.
 bool NebulaNode::is_leader() const {
+    if (raft_) {
+        return raft_->role() == RaftRole::Leader;
+    }
     return elector_->is_leader();
 }
 
+// IMPORTANT: when Raft is wired, leader_id comes from Raft.
 std::optional<std::string> NebulaNode::leader_id() const {
+    if (raft_) {
+        auto lid = raft_->leader_id();
+        if (lid.has_value()) {
+            return lid;
+        }
+        // fall through to gossip if Raft doesn't know yet
+    }
     return elector_->leader_id();
+}
+
+// Return (host, client_port) for the Raft leader (client_port = gossip_port + 2000)
+std::pair<std::string, uint16_t> NebulaNode::leader_address() const {
+    auto lid_opt = leader_id();
+    if (!lid_opt.has_value()) {
+        return {"", 0};
+    }
+    const std::string& lid = *lid_opt;
+
+    // Self is leader
+    if (lid == cfg_.self.id) {
+        return {cfg_.self.host,
+                static_cast<uint16_t>(cfg_.self.gossip_port + 2000)};
+    }
+
+    // Find in peer list
+    for (const auto& p : cfg_.peers) {
+        if (p.id == lid) {
+            return {p.host,
+                    static_cast<uint16_t>(p.gossip_port + 2000)};
+        }
+    }
+
+    return {"", 0}; // unknown leader
 }
 
 void NebulaNode::set_replication_peers(const std::vector<NebulaNode*>& peers) {
@@ -127,58 +164,82 @@ std::pair<std::size_t, uint64_t> NebulaNode::replicate_publish(
 
 /*
     Leader publish:
-    - Append locally
+    - Append locally via Raft
     - Replicate to followers
-    - Require majority acknowledgement
+    - Wait for commit + apply()
 */
 std::pair<std::size_t, uint64_t> NebulaNode::publish(
     const std::string& topic,
     const std::string& key,
-    const std::string& payload) {
-
+    const std::string& payload)
+{
+    // If Raft is wired, use Raft-backed pipeline
     if (raft_) {
         if (raft_->role() != RaftRole::Leader) {
             throw std::runtime_error("publish called on follower");
         }
 
-        std::string cmd = topic + "\n" + key + "\n" + payload;
+        // 1. Allocate publish ID
+        uint64_t pub_id;
+        {
+            std::lock_guard<std::mutex> lock(publish_mutex_);
+            pub_id = next_publish_id_++;
+            waiting_publish_[pub_id] = PublishWait{};
+        }
+
+        // 2. Encode command: pub_id\ntopic\nkey\npayload
+        std::string cmd = std::to_string(pub_id);
+        cmd.push_back('\n');
+        cmd += topic;
+        cmd.push_back('\n');
+        cmd += key;
+        cmd.push_back('\n');
+        cmd += payload;
+
+        // 3. Prepare future to wait on
+        auto& pw = waiting_publish_.at(pub_id);
+        std::future<std::pair<std::size_t, uint64_t>> fut =
+            pw.promise.get_future();
+
+        // 4. Append to Raft log
         raft_->append_client_value(cmd);
 
-        return {0, 0}; // eventually replace with real offsets
+        // 5. Wait for apply() to fulfill the promise
+        auto result = fut.get(); // {partition, offset}
+
+        // 6. Cleanup
+        {
+            std::lock_guard<std::mutex> lock(publish_mutex_);
+            waiting_publish_.erase(pub_id);
+        }
+
+        return result;
     }
 
+    // ---------------------------
+    // LEGACY MODE (NO RAFT)
+    // ---------------------------
     if (!is_leader()) {
-        throw std::runtime_error("publish called on non leader node");
+        throw std::runtime_error("publish called on non-leader (legacy mode)");
     }
 
-    // Fallback: old local replication logic (Mode A) to keep tests working.
     TopicConfig cfg;
     cfg.name = topic;
     cfg.num_partitions = cfg_.default_partitions;
     topics_->create_topic(cfg);
 
     auto local_res = topics_->publish(topic, key, payload);
-    std::size_t partition_index = local_res.first;
-    uint64_t local_offset = local_res.second;
 
-    std::vector<uint64_t> follower_offsets;
-    follower_offsets.reserve(replication_peers_.size());
+    // Legacy replication for in-process test mode
     for (NebulaNode* peer : replication_peers_) {
         if (!peer) continue;
         try {
-            auto peer_res = peer->replicate_publish(topic, key, payload);
-            follower_offsets.push_back(peer_res.second);
-        } catch (const std::exception& ex) {
-            std::cerr << "Replication failed on peer: " << ex.what() << "\n";
-        }
+            peer->replicate_publish(topic, key, payload);
+        } catch (...) {}
     }
 
-    // Existing commit_index_ calculation here, unchanged...
-    // (whatever logic you had computing majority offset and updating commit_index_)
-
-    return {partition_index, local_offset};
+    return local_res;
 }
-
 
 std::optional<std::string> NebulaNode::consume(
     const std::string& topic,
@@ -250,16 +311,52 @@ AppendEntriesResponse NebulaNode::send_append_entries(const std::string& target_
     };
 }
 
-void NebulaNode::apply(const std::string& command) {
-    // Format: topic\nkey\npayload
+// Called by Raft state machine to apply committed commands
+void NebulaNode::apply(const std::string& command)
+{
+    // Decode "pub_id\ntopic\nkey\npayload"
     std::stringstream ss(command);
-    std::string topic, key, payload;
+
+    std::string pub_id_str;
+    std::string topic;
+    std::string key;
+    std::string payload;
+
+    std::getline(ss, pub_id_str);
     std::getline(ss, topic);
     std::getline(ss, key);
     std::getline(ss, payload);
-    if (topic.empty())
+
+    if (topic.empty()) {
+        std::cerr << "[NebulaNode " << cfg_.self.id
+                  << "] apply: empty topic\n";
         return;
-    topics_->publish_from_raft(topic, key, payload);
+    }
+
+    uint64_t pub_id = 0;
+    try { pub_id = std::stoull(pub_id_str); }
+    catch (...) { pub_id = 0; }
+
+    // Ensure topic exists
+    TopicConfig cfg;
+    cfg.name = topic;
+    cfg.num_partitions = cfg_.default_partitions;
+    topics_->create_topic(cfg);
+
+    // Write to partitioned WAL
+    auto [partition, offset] =
+        topics_->publish(topic, key, payload);
+
+    // Only the Raft leader fulfills publish wait.
+    if (raft_ && raft_->role() == RaftRole::Leader && pub_id != 0) {
+        std::lock_guard<std::mutex> lock(publish_mutex_);
+        auto it = waiting_publish_.find(pub_id);
+        if (it != waiting_publish_.end()) {
+            it->second.promise.set_value(
+                std::pair<std::size_t,uint64_t>(partition, offset)
+            );
+        }
+    }
 }
 
 }  // namespace nebula

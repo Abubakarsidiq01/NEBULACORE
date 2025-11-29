@@ -11,7 +11,9 @@ namespace nebula {
 
 using boost::asio::ip::tcp;
 
-// Helpers for big endian encoding
+// ----------------------------
+// Big-endian helpers
+// ----------------------------
 static uint32_t read_u32_be(const char* p) {
     return (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24) |
            (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
@@ -50,7 +52,9 @@ static void write_u64_be(uint64_t v, std::vector<char>& out) {
     }
 }
 
-// Session for each TCP client
+// ----------------------------
+// Per-connection Session
+// ----------------------------
 class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(tcp::socket socket, NebulaNode& node)
@@ -74,7 +78,7 @@ private:
                 }
                 uint32_t len = read_u32_be(read_header_.data());
                 if (len == 0 || len > 1024 * 1024) {
-                    // drop ridiculous frames
+                    // Drop garbage frames
                     return;
                 }
                 read_body_.resize(len);
@@ -121,6 +125,9 @@ private:
         }
     }
 
+    // ----------------------------
+    // Command 1: LEADER_INFO
+    // ----------------------------
     void handle_leader_info() {
         std::vector<char> payload;
         uint8_t status = 0;
@@ -142,6 +149,19 @@ private:
         send_frame(payload);
     }
 
+    // ----------------------------
+    // Command 2: PUBLISH
+    //
+    // Frame payload (after cmd byte):
+    //   [topic_len:u16][topic bytes]
+    //   [key_len:u16][key bytes]
+    //   [payload_len:u32][payload bytes]
+    //
+    // Response:
+    //   status=0: [0][partition:u32][offset:u64]
+    //   status=1: redirect [1][host_len:u16][host bytes][port:u16]
+    //   status=2: error    [2][msg_len:u16][msg bytes]
+    // ----------------------------
     void handle_publish(const char* data, std::size_t size) {
         std::size_t pos = 0;
         if (size < 2) {
@@ -185,19 +205,31 @@ private:
 
         std::vector<char> payload;
 
-        // status
+        // Not leader → redirect
         if (!node_.is_leader()) {
-            payload.push_back(static_cast<char>(1)); // not leader
+            payload.push_back(static_cast<char>(1)); // redirect
 
-            auto lid = node_.leader_id();
-            std::string leader = lid.has_value() ? *lid : std::string("unknown");
-            write_u16_be(static_cast<uint16_t>(leader.size()), payload);
-            payload.insert(payload.end(), leader.begin(), leader.end());
+            auto [host, port] = node_.leader_address();
+            if (host.empty() || port == 0) {
+                // leader unknown → hard error
+                payload.clear();
+                payload.push_back(static_cast<char>(2)); // error
+                std::string msg = "leader unknown";
+                write_u16_be(static_cast<uint16_t>(msg.size()), payload);
+                payload.insert(payload.end(), msg.begin(), msg.end());
+                send_frame(payload);
+                return;
+            }
+
+            write_u16_be(static_cast<uint16_t>(host.size()), payload);
+            payload.insert(payload.end(), host.begin(), host.end());
+            write_u16_be(port, payload);
 
             send_frame(payload);
             return;
         }
 
+        // Leader path
         try {
             auto res = node_.publish(topic, key, body);
             uint32_t partition = static_cast<uint32_t>(res.first);
@@ -216,6 +248,19 @@ private:
         }
     }
 
+    // ----------------------------
+    // Command 3: CONSUME
+    //
+    // Frame payload (after cmd byte):
+    //   [topic_len:u16][topic bytes]
+    //   [group_len:u16][group bytes]
+    //   [partition_idx:u32]
+    //
+    // Response:
+    //   status=0: [0][msg_len:u32][msg bytes]
+    //   status=1: [1] (no message)
+    //   status=2: [2][msg_len:u16][msg bytes]
+    // ----------------------------
     void handle_consume(const char* data, std::size_t size) {
         std::size_t pos = 0;
         if (size < 2) {
@@ -266,6 +311,9 @@ private:
         send_frame(payload);
     }
 
+    // ----------------------------
+    // Common helpers
+    // ----------------------------
     void send_error_response(const std::string& msg) {
         std::vector<char> payload;
         payload.push_back(static_cast<char>(2)); // error
@@ -287,7 +335,7 @@ private:
                 if (ec) {
                     return;
                 }
-                // ready for next request
+                // Ready for next request
                 read_header();
             });
     }
@@ -298,6 +346,9 @@ private:
     std::vector<char> read_body_;
 };
 
+// ----------------------------
+// NodeServer
+// ----------------------------
 NodeServer::NodeServer(const NodeServerConfig& cfg, NebulaNode& node)
     : cfg_(cfg),
       node_(node),
@@ -306,57 +357,62 @@ NodeServer::NodeServer(const NodeServerConfig& cfg, NebulaNode& node)
       io_thread_(),
       running_(false) {}
 
-void NodeServer::start() {
-    if (running_) {
-        return;
-    }
-    running_ = true;
-
-    boost::system::error_code ec;
-    auto addr = boost::asio::ip::make_address(cfg_.host, ec);
-    if (ec) {
-        std::cerr << "NodeServer address error: " << ec.message() << "\n";
-        return;
-    }
-
-    tcp::endpoint ep(addr, cfg_.port);
-    acceptor_ = std::make_unique<tcp::acceptor>(io_);
-
-    acceptor_->open(ep.protocol(), ec);
-    if (ec) {
-        std::cerr << "NodeServer open error: " << ec.message() << "\n";
-        return;
-    }
-
-    acceptor_->set_option(tcp::acceptor::reuse_address(true), ec);
-    if (ec) {
-        std::cerr << "NodeServer reuse_address error: " << ec.message() << "\n";
-        return;
-    }
-
-    acceptor_->bind(ep, ec);
-    if (ec) {
-        std::cerr << "NodeServer bind error: " << ec.message() << "\n";
-        return;
-    }
-
-    acceptor_->listen(boost::asio::socket_base::max_listen_connections, ec);
-    if (ec) {
-        std::cerr << "NodeServer listen error: " << ec.message() << "\n";
-        return;
-    }
-
-    do_accept();
-
-    io_thread_ = std::thread([this]() {
-        try {
-            io_.run();
-        } catch (const std::exception& ex) {
-            std::cerr << "NodeServer io_context exception: " << ex.what() << "\n";
+      void NodeServer::start() { 
+        if (running_) {
+            return;
         }
-    });
-}
-
+        running_ = true;
+    
+        boost::system::error_code ec;
+        auto addr = boost::asio::ip::make_address(cfg_.host, ec);
+        if (ec) {
+            std::cerr << "NodeServer address error: " << ec.message() << "\n";
+            return;
+        }
+    
+        tcp::endpoint ep(addr, cfg_.port);
+        acceptor_ = std::make_unique<tcp::acceptor>(io_);
+    
+        // open
+        acceptor_->open(ep.protocol(), ec);
+        if (ec) {
+            std::cerr << "NodeServer open error: " << ec.message() << "\n";
+            return;
+        }
+    
+        // reuse address
+        acceptor_->set_option(tcp::acceptor::reuse_address(true), ec);
+        if (ec) {
+            std::cerr << "NodeServer reuse_address error: " << ec.message() << "\n";
+            return;
+        }
+    
+        // *** bind with error logging ***
+        acceptor_->bind(ep, ec);
+        if (ec) {
+            std::cerr << "NodeServer bind error: " << ec.message()
+                      << " on " << cfg_.host << ":" << cfg_.port << "\n";
+            return;
+        }
+    
+        // listen
+        acceptor_->listen(boost::asio::socket_base::max_listen_connections, ec);
+        if (ec) {
+            std::cerr << "NodeServer listen error: " << ec.message() << "\n";
+            return;
+        }
+    
+        do_accept();
+    
+        io_thread_ = std::thread([this]() {
+            try {
+                io_.run();
+            } catch (const std::exception& ex) {
+                std::cerr << "NodeServer io_context exception: " << ex.what() << "\n";
+            }
+        });
+    }
+    
 void NodeServer::stop() {
     if (!running_) {
         return;
@@ -394,4 +450,4 @@ void NodeServer::do_accept() {
         });
 }
 
-}  // namespace nebula
+} // namespace nebula

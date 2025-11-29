@@ -95,6 +95,9 @@ private:
 
     // Close socket on error so next call will reconnect.
     void close_socket();
+
+    // Close and reconnect the socket.
+    void reconnect();
 };
 
 } // namespace nebula

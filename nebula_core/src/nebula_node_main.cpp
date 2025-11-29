@@ -7,6 +7,8 @@
 
 #include "nebula_node.h"
 #include "raft_server.h"
+#include "node_server.h"
+
 
 using namespace nebula;
 
@@ -155,6 +157,22 @@ int main(int argc, char** argv) {
     // Now start NebulaNode gossip cluster and RaftClients
     std::cout << "[NebulaNode " << cfg.self.id << "] starting NebulaNode core\n";
     node.start();
+
+    // Client-facing TCP API (Phase 14): listen on gossip_port + 2000
+    uint16_t client_port = static_cast<uint16_t>(cfg.self.gossip_port + 2000);
+
+    NodeServerConfig nsc;
+    nsc.host = cfg.self.host;
+    nsc.port = client_port;
+    
+    NodeServer client_server(nsc, node);
+    client_server.start();
+    
+    std::cout << "[NebulaNode " << cfg.self.id
+              << "] NodeServer listening on "
+              << nsc.host << ":" << nsc.port << "\n";
+    
+    
 
     if (cfg.self.id == "n1") {
         std::thread([&]() {

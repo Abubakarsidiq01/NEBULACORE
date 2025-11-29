@@ -6,6 +6,8 @@
 #include <thread>
 #include <vector>
 #include <optional>
+#include <future>
+#include <mutex>
 
 #include <boost/asio.hpp>
 #include <unordered_map>
@@ -36,7 +38,10 @@ public:
     bool is_leader() const;
     std::optional<std::string> leader_id() const;
 
-    // Leader-only publish (performs replication)
+    // Return (host, client_port) for the Raft leader (client_port = gossip_port + 2000)
+    std::pair<std::string, uint16_t> leader_address() const;
+
+    // Raft-backed publish (leader only)
     std::pair<std::size_t, uint64_t> publish(
         const std::string& topic,
         const std::string& key,
@@ -119,6 +124,16 @@ private:
     std::unordered_map<PartitionKey, uint64_t, PartitionKeyHash> commit_index_;
 
     std::unordered_map<std::string, std::unique_ptr<RaftClient>> raft_clients_;
+
+    // Publish ID tracking (leader waits for Raft commit)
+    mutable std::mutex publish_mutex_;
+    uint64_t next_publish_id_ = 1;
+
+    struct PublishWait {
+        std::promise<std::pair<std::size_t, uint64_t>> promise;
+    };
+
+    std::unordered_map<uint64_t, PublishWait> waiting_publish_;
 
 
     void run_io();

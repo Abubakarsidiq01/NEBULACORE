@@ -158,7 +158,7 @@ private:
 
     // timers
     int election_timeout_ms_;
-    int heartbeat_interval_ms_ = 150;
+    int heartbeat_interval_ms_ = 200;
     std::chrono::steady_clock::time_point last_heartbeat_;
 
     std::vector<RaftNode*> peers_;
@@ -172,14 +172,15 @@ private:
     int random_timeout_ms();
 
     uint64_t last_log_index() const {
-        if (log_.empty()) return static_cast<uint64_t>(-1);
+        if (log_.empty()) return 0;
         return static_cast<uint64_t>(log_.size() - 1);
     }
-
+    
     uint64_t last_log_term() const {
         if (log_.empty()) return 0;
         return static_cast<uint64_t>(log_.back().term);
     }
+    
 
     bool is_log_up_to_date(uint64_t other_last_index,
                            uint64_t other_last_term) const;

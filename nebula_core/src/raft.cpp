@@ -9,13 +9,30 @@ RaftNode::RaftNode(std::string id)
 {
     election_timeout_ms_ = random_timeout_ms();
     last_heartbeat_ = std::chrono::steady_clock::now();
+
+    // Normalize empty log state (prevent UINT64_MAX madness)
+    commit_index_ = 0;
+    last_applied_ = 0;
+
+    // A completely empty log is treated as index = -1 but we normalize
+    // internal counters so AppendEntries flow works correctly.
 }
 
 int RaftNode::random_timeout_ms() {
     static thread_local std::mt19937 rng(std::random_device{}());
+
+    // In network mode (NebulaCore), give Raft a lot more slack.
+    // Heartbeat ~= 200ms, so election timeout is 1200–2400ms.
+    if (transport_) {
+        std::uniform_int_distribution<int> dist(1200, 2400);
+        return dist(rng);
+    }
+
+    // In in-memory test mode, keep timeouts short so unit tests stay fast.
     std::uniform_int_distribution<int> dist(300, 500);
     return dist(rng);
 }
+
 
 bool RaftNode::is_log_up_to_date(uint64_t other_last_index,
                                  uint64_t other_last_term) const {
@@ -127,7 +144,7 @@ void RaftNode::become_leader() {
     match_index_.clear();
     next_index_.clear();
 
-    // first index *after* the last entry (0 if empty, N if N entries)
+    // first index after the last entry (0 if empty, N if N entries)
     size_t last_index = log_.size();
 
     // Mode A: in-process peers
@@ -405,36 +422,34 @@ void RaftNode::send_append_entries_to_peer(RaftNode* peer) {
 // -------------------------
 // Mode B: network peers by ID
 // -------------------------
-void RaftNode::send_append_entries_to_peer(const std::string& peer_id) {
+void RaftNode::send_append_entries_to_peer(const std::string& peer_id) { 
     if (!transport_) return;
 
     // Safe lookup for next index
-    size_t next = 0;
+    size_t next_idx = 0;
     auto it = next_index_.find(peer_id);
     if (it != next_index_.end()) {
-        next = it->second;
+        next_idx = it->second;
     }
 
     // -----------------------------
     // Compute prev_idx / prev_term safely
     // -----------------------------
     size_t prev_idx;
-    int prev_term;
+    uint64_t prev_term;
 
-    // If leader log is empty → send (-1,0) which means "no previous entry"
+    // If log is empty → (-1, 0)
     if (log_.empty()) {
         prev_idx = static_cast<size_t>(-1);
         prev_term = 0;
     } else {
-        if (next == 0) {
-            // follower has nothing, so previous index = -1
+        if (next_idx == 0) {
             prev_idx = static_cast<size_t>(-1);
             prev_term = 0;
         } else {
-            // normal case
-            prev_idx = next - 1;
+            prev_idx = next_idx - 1;
 
-            // Clamp to avoid out-of-range access
+            // Clamp
             if (prev_idx >= log_.size()) {
                 prev_idx = log_.size() - 1;
             }
@@ -447,8 +462,8 @@ void RaftNode::send_append_entries_to_peer(const std::string& peer_id) {
     // Collect entries safely
     // -----------------------------
     std::vector<LogEntry> entries;
-    if (!log_.empty() && next < log_.size()) {
-        for (size_t i = next; i < log_.size(); ++i) {
+    if (!log_.empty() && next_idx < log_.size()) {
+        for (size_t i = next_idx; i < log_.size(); ++i) {
             entries.push_back(log_[i]);
         }
     }
@@ -459,15 +474,16 @@ void RaftNode::send_append_entries_to_peer(const std::string& peer_id) {
     size_t leader_commit;
 
     if (commit_index_ == (size_t)-1) {
-        // leader has no commits yet
         leader_commit = (size_t)-1;
     } else {
-        // clamp commit to valid log size
-        leader_commit = std::min(commit_index_, log_.empty() ? (size_t)0 : log_.size() - 1);
+        leader_commit = std::min(
+            commit_index_,
+            log_.empty() ? (size_t)0 : (log_.size() - 1)
+        );
     }
 
     // -----------------------------
-    // Build request
+    // FINAL REQUEST — using your format
     // -----------------------------
     AppendEntriesRequest req{
         .leader_id = id_,
@@ -479,7 +495,7 @@ void RaftNode::send_append_entries_to_peer(const std::string& peer_id) {
     };
 
     // -----------------------------
-    // Send to follower (network)
+    // Send RPC
     // -----------------------------
     try {
         auto resp = transport_->send_append_entries(peer_id, req);
@@ -491,6 +507,7 @@ void RaftNode::send_append_entries_to_peer(const std::string& peer_id) {
                   << peer_id << " failed: " << ex.what() << "\n";
     }
 }
+
 
 
 void RaftNode::append_client_value(const std::string& value) {
@@ -527,14 +544,15 @@ void RaftNode::append_client_value(const std::string& value) {
 }
 
 void RaftNode::apply_committed() {
-    std::cout << "[" << id_
-              << "] apply_committed: last_applied=" << last_applied_
-              << " commit_index=" << commit_index_ << "\n";
-
-    if (commit_index_ == static_cast<size_t>(-1))
+    // Do not spam logs
+    if (commit_index_ == last_applied_)
         return;
 
-    size_t start = (last_applied_ == static_cast<size_t>(-1))
+    // No log entries to apply
+    if (log_.empty())
+        return;
+
+    size_t start = (last_applied_ == 0)
                    ? 0
                    : last_applied_ + 1;
 
@@ -542,30 +560,32 @@ void RaftNode::apply_committed() {
         return;
 
     for (size_t i = start; i <= commit_index_ && i < log_.size(); ++i) {
-        applied_values_.push_back(log_[i].value);
 
+        // Apply actual command
         if (state_machine_) {
             state_machine_->apply(log_[i].value);
         }
-
-        std::cout << "[" << id_
-                  << "] apply_committed: applying index " << i
-                  << " term=" << log_[i].term << "\n";
 
         last_applied_ = i;
     }
 }
 
+
 void RaftNode::tick() {
+    // Single process boot timestamp so we don't start elections
+    // in the first few hundred ms while networking is still wiring up.
     static const auto process_boot =
         std::chrono::steady_clock::now();
 
     auto now = std::chrono::steady_clock::now();
 
+    // In network mode, give the system 1s to bring up all RaftServers
+    // and establish TCP connections before we start running elections.
     if (transport_) {
-        auto since_boot_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 now - process_boot)
-                                 .count();
+        auto since_boot_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - process_boot)
+                .count();
         if (since_boot_ms < 1000) {
             return;
         }
@@ -575,15 +595,18 @@ void RaftNode::tick() {
                        now - last_heartbeat_)
                        .count();
 
+    // ---------------- Leader path: send heartbeats
     if (role_ == RaftRole::Leader) {
         if (elapsed > heartbeat_interval_ms_) {
             last_heartbeat_ = now;
 
             if (!peers_.empty()) {
+                // in-process mode
                 for (RaftNode* p : peers_) {
                     send_append_entries_to_peer(p);
                 }
             } else if (transport_ && !peer_ids_.empty()) {
+                // network mode
                 for (const auto& pid : peer_ids_) {
                     send_append_entries_to_peer(pid);
                 }
@@ -592,7 +615,11 @@ void RaftNode::tick() {
         return;
     }
 
-    // Phase 8 hack: make node1 become leader quickly in 3-node snapshot test
+    // ---------------- Follower / Candidate path
+
+    // Phase 8 hack for pure in-memory tests: force node1 to grab leadership
+    // quickly when there is no transport. This DOES NOT run in NebulaCore
+    // because transport_ is set there.
     if (!transport_ && role_ == RaftRole::Follower &&
         current_term_ == 0 &&
         id_ == "node1")
@@ -602,11 +629,14 @@ void RaftNode::tick() {
         return;
     }
 
+    // Normal election timeout: if we haven't heard from a leader
+    // within election_timeout_ms_, start a new election.
     if (elapsed > election_timeout_ms_) {
         become_candidate();
         last_heartbeat_ = std::chrono::steady_clock::now();
     }
 }
+
 
 // Phase 8: snapshot support
 

@@ -410,6 +410,37 @@ void RaftClient::close_socket() {
     }
 }
 
+void RaftClient::reconnect() {
+    // Close previous socket
+    boost::system::error_code ec;
+    socket_.close(ec);
+
+    // Resolve host -> address
+    auto addr = boost::asio::ip::make_address(host_, ec);
+    if (ec) {
+        std::cerr << "[RaftClient] reconnect: invalid host " << host_
+                  << " error=" << ec.message() << "\n";
+        return;
+    }
+
+    boost::asio::ip::tcp::endpoint ep(addr, port_);
+
+    // Start async connect
+    socket_.async_connect(
+        ep,
+        [this](const boost::system::error_code& ec2) {
+            if (!ec2) {
+                std::cout << "[RaftClient] reconnected to "
+                          << host_ << ":" << port_ << "\n";
+            } else {
+                std::cerr << "[RaftClient] reconnect failed: "
+                          << ec2.message() << "\n";
+            }
+        }
+    );
+}
+
+
 void RaftClient::ensure_connected() {
     if (socket_.is_open()) {
         return;
@@ -551,8 +582,10 @@ AppendEntriesResponse RaftClient::append_entries(const AppendEntriesRequest& req
     std::vector<char> resp(len);
     boost::asio::read(socket_, boost::asio::buffer(resp.data(), resp.size()), ec);
     if (ec) {
-        close_socket();
-        throw std::runtime_error("RaftClient AppendEntries read body error: " + ec.message());
+        std::cerr << "[RaftClient] AppendEntries read error: "
+                  << ec.message() << " (retrying)\n";
+        reconnect();
+        return append_entries(req);
     }
 
     if (resp.empty() || resp[0] != static_cast<char>(RaftRpcType::AppendEntries)) {

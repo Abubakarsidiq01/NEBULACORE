@@ -23,6 +23,10 @@ def main():
     for i in range(count):
         msg = f"bench-{i}"
         res = client.publish(topic, key, msg)
+        
+        if i % 300 == 0:
+            time.sleep(0.05)
+        
         if res["status"] == "ok":
             ok += 1
         else:

@@ -172,7 +172,7 @@ private:
     int random_timeout_ms();
 
     uint64_t last_log_index() const {
-        if (log_.empty()) return 0;
+        if (log_.empty()) return static_cast<uint64_t>(-1);
         return static_cast<uint64_t>(log_.size() - 1);
     }
     

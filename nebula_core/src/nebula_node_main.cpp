@@ -179,10 +179,16 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(3));
             std::cout << "\n[PUBLISH TEST] Publishing test message...\n";
             try {
-                node.publish("alerts", "k1", "hello world from raft");
+                auto [p, off] = node.publish("alerts", "k1", "hello world from raft");
+                std::cout << "[PUBLISH TEST] leader returned partition=" << p
+                          << " offset=" << off << "\n";
+    
+                auto committed = node.committed_offset("alerts", p);
+                std::cout << "[PUBLISH TEST] committed_offset(alerts," << p
+                          << ") = " << committed << "\n";
             } catch (const std::exception& ex) {
                 std::cerr << "[PUBLISH ERROR] " << ex.what() << "\n";
-            }
+            }    
         }).detach();
     }
     

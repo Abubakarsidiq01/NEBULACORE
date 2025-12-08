@@ -10,9 +10,8 @@ RaftNode::RaftNode(std::string id)
     election_timeout_ms_ = random_timeout_ms();
     last_heartbeat_ = std::chrono::steady_clock::now();
 
-    // Normalize empty log state (prevent UINT64_MAX madness)
-    commit_index_ = 0;
-    last_applied_ = 0;
+    commit_index_ = static_cast<size_t>(-1);
+    last_applied_ = static_cast<size_t>(-1);
 
     // A completely empty log is treated as index = -1 but we normalize
     // internal counters so AppendEntries flow works correctly.
@@ -140,33 +139,35 @@ void RaftNode::become_leader() {
 
     std::cout << id_ << " is LEADER for term " << current_term_ << "\n";
 
-    // Initialize follower state
+    // Reset follower state tracking
     match_index_.clear();
     next_index_.clear();
 
-    // first index after the last entry (0 if empty, N if N entries)
-    size_t last_index = log_.size();
+    // Correct next index for ALL followers:
+    //   empty log → 0
+    //   log with N entries → N
+    size_t next = log_.empty() ? 0 : log_.size();
 
-    // Mode A: in-process peers
+    // In-memory peers
     for (RaftNode* p : peers_) {
         match_index_[p->id_] = static_cast<size_t>(-1);
-        next_index_[p->id_] = last_index;
+        next_index_[p->id_] = next;
     }
 
-    // Mode B: network peers by ID
+    // Network peers
     for (const auto& pid : peer_ids_) {
         match_index_[pid] = static_cast<size_t>(-1);
-        next_index_[pid] = last_index;
+        next_index_[pid] = next;
     }
 
-    // Track our own match index
+    // Leader's own match index
     if (log_.empty()) {
         match_index_[id_] = static_cast<size_t>(-1);
     } else {
         match_index_[id_] = log_.size() - 1;
     }
 
-    // Immediately send heartbeats to followers
+    // Immediately send initial heartbeat / AppendEntries
     if (!peers_.empty()) {
         for (RaftNode* p : peers_) {
             send_append_entries_to_peer(p);

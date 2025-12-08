@@ -347,6 +347,12 @@ void NebulaNode::apply(const std::string& command)
     auto [partition, offset] =
         topics_->publish(topic, key, payload);
 
+    // Update committed offset index for this topic partition
+    {
+        PartitionKey pk{topic, partition};
+        commit_index_[pk] = offset;
+    }
+
     // Only the Raft leader fulfills publish wait.
     if (raft_ && raft_->role() == RaftRole::Leader && pub_id != 0) {
         std::lock_guard<std::mutex> lock(publish_mutex_);

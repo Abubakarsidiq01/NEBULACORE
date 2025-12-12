@@ -12,6 +12,7 @@ namespace nebula {
 struct LogConfig {
     std::string directory;       // directory for log files
     std::string base_filename;   // base file name, e.g. "segment_00000000.log"
+    uint64_t max_segment_bytes{8 * 1024 * 1024}; // 8MB default (tune later)
 };
 
 class NebulaLog {
@@ -49,12 +50,30 @@ public:
     Iterator scan(uint64_t start_offset);
 
 private:
-    void recover_index();
-
-    std::filesystem::path path_;
-    std::fstream file_;
-    std::vector<uint64_t> offset_index_;   // logical_offset -> file position
+    struct EntryRef {
+        uint32_t seg;     // segment index in segments_
+        uint64_t pos;     // byte position within that segment file
+    };
+    
+    struct Segment {
+        uint64_t base_offset;
+        std::filesystem::path path;
+        std::fstream file;
+        uint64_t size_bytes{0};
+    };
+    
+    LogConfig cfg_;
+    std::vector<Segment> segments_;            // ordered by base_offset
+    std::vector<EntryRef> offset_index_;       // logical_offset -> {segment, pos}
     uint64_t next_logical_offset_{0};
+    
+    void recover_segments();
+    void roll_segment();                       // create a new active segment at next_logical_offset_
+    Segment& active_segment();
+    static uint64_t file_size_bytes(const std::filesystem::path& p);
+    static std::string segment_filename(const std::string& prefix, uint64_t base_offset);
+    static bool parse_segment_base(const std::string& name, const std::string& prefix, uint64_t& out_base);
+    
 };
 
 } // namespace nebula

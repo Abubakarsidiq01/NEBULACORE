@@ -2,153 +2,99 @@
 
 #include <stdexcept>
 #include <iostream>
+#include <algorithm> 
 
 namespace nebula {
 
-NebulaLog::NebulaLog(const LogConfig& cfg) {
-    // Build full path: directory / base_filename
-    std::filesystem::path dir_path(cfg.directory);
-    if (!cfg.directory.empty()) {
-        std::filesystem::create_directories(dir_path);
+    NebulaLog::NebulaLog(const LogConfig& cfg)
+    : cfg_(cfg) {
+
+    // Ensure log directory exists
+    if (!cfg_.directory.empty()) {
+        std::filesystem::create_directories(cfg_.directory);
     }
 
-    path_ = dir_path / cfg.base_filename;
+    // Recover existing segments and index
+    recover_segments();
 
-    const bool existed = std::filesystem::exists(path_);
-
-    // Try to open for read/write. If it fails (for example file does not exist), create it
-    file_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file_.is_open()) {
-        // Create a new empty file
-        file_.clear();
-        file_.open(path_, std::ios::out | std::ios::binary);
-        if (!file_.is_open()) {
-            throw std::runtime_error("Failed to create log file: " + path_.string());
-        }
-        file_.close();
-
-        // Reopen in read/write mode
-        file_.open(path_, std::ios::in | std::ios::out | std::ios::binary);
-        if (!file_.is_open()) {
-            throw std::runtime_error("Failed to open log file: " + path_.string());
-        }
+    // If no segments exist, create the first one
+    if (segments_.empty()) {
+        roll_segment();
     }
 
-    if (existed) {
-        recover_index();
-    } else {
-        offset_index_.clear();
-        next_logical_offset_ = 0;
-        file_.clear();
-        file_.seekp(0, std::ios::end);
-    }
+    next_logical_offset_ = offset_index_.size();
 }
 
 NebulaLog::~NebulaLog() {
-    if (file_.is_open()) {
-        file_.close();
+    for (auto& seg : segments_) {
+        if (seg.file.is_open()) {
+            seg.file.close();
+        }
     }
-}
-
-void NebulaLog::recover_index() {
-    offset_index_.clear();
-    file_.clear();
-    file_.seekg(0, std::ios::beg);
-
-    uint64_t logical = 0;
-    while (true) {
-        std::streampos pos = file_.tellg();
-        if (pos == std::streampos(-1)) {
-            break;
-        }
-
-        uint32_t len = 0;
-        file_.read(reinterpret_cast<char*>(&len), sizeof(len));
-        if (!file_) {
-            // Either EOF or a read error. Clear flags and stop
-            file_.clear();
-            break;
-        }
-
-        // Zero length would be weird. Treat it as stop
-        if (len == 0) {
-            break;
-        }
-
-        // Record starting position for this logical offset
-        offset_index_.push_back(static_cast<uint64_t>(pos));
-
-        // Skip payload bytes
-        file_.seekg(len, std::ios::cur);
-        if (!file_) {
-            file_.clear();
-            break;
-        }
-
-        ++logical;
-    }
-
-    next_logical_offset_ = logical;
-
-    // Prepare for appends
-    file_.clear();
-    file_.seekp(0, std::ios::end);
 }
 
 uint64_t NebulaLog::append(const std::string& payload) {
-    file_.clear();
-    file_.seekp(0, std::ios::end);
+    const uint64_t record_bytes = sizeof(uint32_t) + payload.size();
 
-    std::streampos pos = file_.tellp();
+    Segment& seg = active_segment();
+    if (seg.size_bytes + record_bytes > cfg_.max_segment_bytes) {
+        roll_segment();
+    }
+
+    Segment& active = active_segment();
+    active.file.clear();
+    active.file.seekp(0, std::ios::end);
+
+    std::streampos pos = active.file.tellp();
     if (pos == std::streampos(-1)) {
-        throw std::runtime_error("Failed to seek in log file: " + path_.string());
+        throw std::runtime_error("Failed to seek in segment");
     }
 
     uint32_t len = static_cast<uint32_t>(payload.size());
-    file_.write(reinterpret_cast<const char*>(&len), sizeof(len));
-    file_.write(payload.data(), len);
-    if (!file_) {
-        throw std::runtime_error("Failed to write to log file: " + path_.string());
-    }
-    file_.flush();
+    active.file.write(reinterpret_cast<const char*>(&len), sizeof(len));
+    active.file.write(payload.data(), len);
+    active.file.flush();
 
-    uint64_t logical = next_logical_offset_++;
-    if (logical >= offset_index_.size()) {
-        offset_index_.push_back(static_cast<uint64_t>(pos));
-    } else {
-        offset_index_[logical] = static_cast<uint64_t>(pos);
-    }
+    active.size_bytes += record_bytes;
 
-    return logical;
+    offset_index_.push_back(
+        EntryRef{
+            static_cast<uint32_t>(segments_.size() - 1),
+            static_cast<uint64_t>(pos)
+        });
+
+    return next_logical_offset_++;
 }
 
 std::optional<std::string> NebulaLog::read(uint64_t logical_offset) {
-    if (logical_offset >= next_logical_offset_) {
-        return std::nullopt;
-    }
     if (logical_offset >= offset_index_.size()) {
         return std::nullopt;
     }
 
-    uint64_t pos = offset_index_[logical_offset];
-    file_.clear();
-    file_.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
-    if (!file_) {
-        file_.clear();
+    const EntryRef& ref = offset_index_[logical_offset];
+    if (ref.seg >= segments_.size()) {
+        return std::nullopt;
+    }
+
+    Segment& seg = segments_[ref.seg];
+    seg.file.clear();
+    seg.file.seekg(static_cast<std::streamoff>(ref.pos), std::ios::beg);
+    if (!seg.file) {
+        seg.file.clear();
         return std::nullopt;
     }
 
     uint32_t len = 0;
-    file_.read(reinterpret_cast<char*>(&len), sizeof(len));
-    if (!file_ || len == 0) {
-        file_.clear();
+    seg.file.read(reinterpret_cast<char*>(&len), sizeof(len));
+    if (!seg.file || len == 0) {
+        seg.file.clear();
         return std::nullopt;
     }
 
     std::string buf(len, '\0');
-    file_.read(buf.data(), len);
-    if (!file_) {
-        file_.clear();
+    seg.file.read(buf.data(), len);
+    if (!seg.file) {
+        seg.file.clear();
         return std::nullopt;
     }
 
@@ -190,6 +136,126 @@ uint64_t NebulaLog::Iterator::offset() const {
 
 const std::string& NebulaLog::Iterator::value() const {
     return current_value_;
+}
+
+uint64_t NebulaLog::file_size_bytes(const std::filesystem::path& p) {
+    if (!std::filesystem::exists(p)) return 0;
+    return std::filesystem::file_size(p);
+}
+
+std::string NebulaLog::segment_filename(const std::string& prefix,
+                                        uint64_t base_offset) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s_%020llu.log",
+                  prefix.c_str(),
+                  static_cast<unsigned long long>(base_offset));
+    return std::string(buf);
+}
+
+bool NebulaLog::parse_segment_base(const std::string& name,
+                                   const std::string& prefix,
+                                   uint64_t& out_base) {
+    if (name.rfind(prefix + "_", 0) != 0) return false;
+    if (name.size() < prefix.size() + 5) return false;
+    if (name.substr(name.size() - 4) != ".log") return false;
+
+    const std::string num =
+        name.substr(prefix.size() + 1,
+                    name.size() - prefix.size() - 5);
+
+    try {
+        out_base = std::stoull(num);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void NebulaLog::recover_segments() {
+    segments_.clear();
+    offset_index_.clear();
+
+    if (!std::filesystem::exists(cfg_.directory)) {
+        return;
+    }
+
+    // Discover segment files
+    for (const auto& entry : std::filesystem::directory_iterator(cfg_.directory)) {
+        if (!entry.is_regular_file()) continue;
+
+        uint64_t base = 0;
+        const std::string name = entry.path().filename().string();
+        if (!parse_segment_base(name, cfg_.base_filename, base)) continue;
+
+        Segment seg;
+        seg.base_offset = base;
+        seg.path = entry.path();
+        seg.size_bytes = file_size_bytes(seg.path);
+
+        seg.file.open(seg.path,
+                      std::ios::in | std::ios::out | std::ios::binary);
+        if (!seg.file.is_open()) {
+            throw std::runtime_error("Failed to open segment: " + seg.path.string());
+        }
+
+        segments_.push_back(std::move(seg));
+    }
+
+    // Sort by base offset
+    std::sort(segments_.begin(), segments_.end(),
+              [](const Segment& a, const Segment& b) {
+                  return a.base_offset < b.base_offset;
+              });
+
+    // Scan records
+    for (size_t si = 0; si < segments_.size(); ++si) {
+        auto& seg = segments_[si];
+        seg.file.clear();
+        seg.file.seekg(0, std::ios::beg);
+
+        while (true) {
+            std::streampos pos = seg.file.tellg();
+            if (pos == std::streampos(-1)) break;
+
+            uint32_t len = 0;
+            seg.file.read(reinterpret_cast<char*>(&len), sizeof(len));
+            if (!seg.file || len == 0) {
+                seg.file.clear();
+                break;
+            }
+
+            offset_index_.push_back(
+                EntryRef{static_cast<uint32_t>(si),
+                         static_cast<uint64_t>(pos)});
+
+            seg.file.seekg(len, std::ios::cur);
+            if (!seg.file) {
+                seg.file.clear();
+                break;
+            }
+        }
+    }
+}
+
+NebulaLog::Segment& NebulaLog::active_segment() {
+    return segments_.back();
+}
+
+void NebulaLog::roll_segment() {
+    Segment seg;
+    seg.base_offset = next_logical_offset_;
+    seg.path = std::filesystem::path(cfg_.directory) /
+               segment_filename(cfg_.base_filename, seg.base_offset);
+
+    seg.file.open(seg.path,
+                  std::ios::in | std::ios::out |
+                  std::ios::binary | std::ios::trunc);
+    if (!seg.file.is_open()) {
+        throw std::runtime_error("Failed to create segment: " + seg.path.string());
+    }
+
+    seg.size_bytes = 0;
+    segments_.push_back(std::move(seg));
 }
 
 } // namespace nebula

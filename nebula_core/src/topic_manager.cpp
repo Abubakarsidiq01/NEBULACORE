@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <functional>
 #include <stdexcept>
+#include <fstream>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -45,7 +47,9 @@ TopicManager::TopicState& TopicManager::get_or_create_topic(const TopicConfig& c
 
         LogConfig log_cfg;
         log_cfg.directory = dir;
-        log_cfg.base_filename = "segment_00000000.log";
+        log_cfg.base_filename = "segment";
+        log_cfg.max_segment_bytes = 8 * 1024 * 1024; // 8MB for now
+
 
         PartitionState part;
         part.log = std::make_unique<NebulaLog>(log_cfg);
@@ -53,6 +57,7 @@ TopicManager::TopicState& TopicManager::get_or_create_topic(const TopicConfig& c
     }
 
     auto [insert_it, _] = topics_.emplace(cfg.name, std::move(state));
+    load_group_offsets(cfg.name, insert_it->second);
     return insert_it->second;
 }
 
@@ -119,6 +124,7 @@ std::optional<std::string> TopicManager::read_next(
 
     // advance offset for this group and partition
     current_offset += 1;
+    save_group_offsets(topic, state);
     return val;
 }
 
@@ -143,6 +149,76 @@ std::optional<uint64_t> TopicManager::current_offset(
         return std::nullopt;
     }
     return offsets[partition_index];
+}
+
+std::string TopicManager::group_state_path(const std::string& topic) const {
+    // One metadata file per topic:
+    //   <data_root_>/<topic>_groups.meta
+    return data_root_ + "/" + topic + "_groups.meta";
+}
+
+void TopicManager::load_group_offsets(const std::string& topic, TopicState& state) {
+    const std::string path = group_state_path(topic);
+
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        // No metadata yet (first run or no consumers)
+        return;
+    }
+
+    // Format per line:
+    //   group_name offset0 offset1 offset2 ...
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+
+        std::istringstream iss(line);
+        std::string group;
+        if (!(iss >> group)) {
+            continue;
+        }
+
+        std::vector<uint64_t> offsets;
+        uint64_t off = 0;
+        while (iss >> off) {
+            offsets.push_back(off);
+        }
+
+        // If the topic has grown more partitions, pad with zeros.
+        if (offsets.size() < state.partitions.size()) {
+            offsets.resize(state.partitions.size(), 0);
+        }
+        // If the topic has fewer partitions than stored, truncate.
+        if (offsets.size() > state.partitions.size()) {
+            offsets.resize(state.partitions.size());
+        }
+
+        state.group_offsets[group] = std::move(offsets);
+    }
+}
+
+void TopicManager::save_group_offsets(const std::string& topic,
+                                      const TopicState& state) const {
+    const std::string path = group_state_path(topic);
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        // Best-effort; if this fails, consumer offsets remain in memory only.
+        return;
+    }
+
+    // Write each consumer group's offsets on one line:
+    //   group_name offset0 offset1 offset2 ...
+    for (const auto& kv : state.group_offsets) {
+        const std::string& group = kv.first;
+        const std::vector<uint64_t>& offsets = kv.second;
+
+        out << group;
+        for (uint64_t off : offsets) {
+            out << ' ' << off;
+        }
+        out << '\n';
+    }
 }
 
 }  // namespace nebula

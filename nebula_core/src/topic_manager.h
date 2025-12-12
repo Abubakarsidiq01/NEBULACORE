@@ -63,6 +63,11 @@ private:
 
     TopicState& get_or_create_topic(const TopicConfig& cfg);
     std::size_t choose_partition(const std::string& key, std::size_t num_partitions) const;
+
+    // Phase 16: durable consumer group offsets
+    std::string group_state_path(const std::string& topic) const;
+    void load_group_offsets(const std::string& topic, TopicState& state);
+    void save_group_offsets(const std::string& topic, const TopicState& state) const;
 };
 
 }  // namespace nebula

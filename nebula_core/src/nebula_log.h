@@ -13,6 +13,9 @@ struct LogConfig {
     std::string directory;       // directory for log files
     std::string base_filename;   // base file name, e.g. "segment_00000000.log"
     uint64_t max_segment_bytes{8 * 1024 * 1024}; // 8MB default (tune later)
+    uint64_t retention_max_bytes{0};     // 0 = disabled
+    uint64_t retention_max_segments{0};  // 0 = disabled
+
 };
 
 class NebulaLog {
@@ -25,6 +28,9 @@ public:
 
     // Read record at logical offset. Returns nullopt if out of range or corrupted
     std::optional<std::string> read(uint64_t logical_offset);
+
+    // Delete old segments (safe) while keeping offsets >= min_offset_to_keep
+    void cleanup(uint64_t min_offset_to_keep);
 
     class Iterator {
     public:
@@ -60,11 +66,13 @@ private:
         std::filesystem::path path;
         std::fstream file;
         uint64_t size_bytes{0};
+        uint64_t next_offset{0};  
     };
     
     LogConfig cfg_;
     std::vector<Segment> segments_;            // ordered by base_offset
     std::vector<EntryRef> offset_index_;       // logical_offset -> {segment, pos}
+    uint64_t base_logical_offset_{0}; // first logical offset represented by offset_index_
     uint64_t next_logical_offset_{0};
     
     void recover_segments();

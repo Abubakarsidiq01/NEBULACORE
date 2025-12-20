@@ -22,7 +22,11 @@ namespace nebula {
         roll_segment();
     }
 
-    next_logical_offset_ = offset_index_.size();
+    // next_logical_offset_ is set in recover_segments() if segments were recovered
+    // If no segments were recovered, it starts at base_logical_offset_ (which is 0)
+    if (offset_index_.empty()) {
+        next_logical_offset_ = base_logical_offset_;
+    }
 }
 
 NebulaLog::~NebulaLog() {
@@ -36,11 +40,11 @@ NebulaLog::~NebulaLog() {
 uint64_t NebulaLog::append(const std::string& payload) {
     const uint64_t record_bytes = sizeof(uint32_t) + payload.size();
 
-    Segment& seg = active_segment();
-    if (seg.size_bytes + record_bytes > cfg_.max_segment_bytes) {
+
+    if (active_segment().size_bytes + record_bytes > cfg_.max_segment_bytes) {
         roll_segment();
     }
-
+    
     Segment& active = active_segment();
     active.file.clear();
     active.file.seekp(0, std::ios::end);
@@ -63,15 +67,23 @@ uint64_t NebulaLog::append(const std::string& payload) {
             static_cast<uint64_t>(pos)
         });
 
-    return next_logical_offset_++;
+    uint64_t off = next_logical_offset_++;
+    segments_.back().next_offset = next_logical_offset_;
+    return off;
 }
 
 std::optional<std::string> NebulaLog::read(uint64_t logical_offset) {
-    if (logical_offset >= offset_index_.size()) {
+    // Phase 18: offset may have been trimmed
+    if (logical_offset < base_logical_offset_) {
         return std::nullopt;
     }
 
-    const EntryRef& ref = offset_index_[logical_offset];
+    uint64_t idx = logical_offset - base_logical_offset_;
+    if (idx >= offset_index_.size()) {
+        return std::nullopt;
+    }
+
+    const EntryRef& ref = offset_index_[idx];
     if (ref.seg >= segments_.size()) {
         return std::nullopt;
     }
@@ -207,12 +219,17 @@ void NebulaLog::recover_segments() {
                   return a.base_offset < b.base_offset;
               });
 
+    if (!segments_.empty()) {
+        base_logical_offset_ = segments_.front().base_offset;
+    }
+
     // Scan records
     for (size_t si = 0; si < segments_.size(); ++si) {
         auto& seg = segments_[si];
         seg.file.clear();
         seg.file.seekg(0, std::ios::beg);
 
+        uint64_t seg_entries = 0;
         while (true) {
             std::streampos pos = seg.file.tellg();
             if (pos == std::streampos(-1)) break;
@@ -228,13 +245,18 @@ void NebulaLog::recover_segments() {
                 EntryRef{static_cast<uint32_t>(si),
                          static_cast<uint64_t>(pos)});
 
+            seg_entries++;
+
             seg.file.seekg(len, std::ios::cur);
             if (!seg.file) {
                 seg.file.clear();
                 break;
             }
         }
+        seg.next_offset = seg.base_offset + seg_entries;
     }
+    
+    next_logical_offset_ = base_logical_offset_ + offset_index_.size();
 }
 
 NebulaLog::Segment& NebulaLog::active_segment() {
@@ -244,6 +266,7 @@ NebulaLog::Segment& NebulaLog::active_segment() {
 void NebulaLog::roll_segment() {
     Segment seg;
     seg.base_offset = next_logical_offset_;
+    seg.next_offset = seg.base_offset; 
     seg.path = std::filesystem::path(cfg_.directory) /
                segment_filename(cfg_.base_filename, seg.base_offset);
 
@@ -256,6 +279,59 @@ void NebulaLog::roll_segment() {
 
     seg.size_bytes = 0;
     segments_.push_back(std::move(seg));
+}
+
+void NebulaLog::cleanup(uint64_t min_offset_to_keep) {
+    // Retention disabled
+    if (cfg_.retention_max_segments == 0 &&
+        cfg_.retention_max_bytes == 0) {
+        return;
+    }
+
+    // Never delete the active segment
+    while (segments_.size() > 1) {
+        Segment& oldest = segments_.front();
+
+        // Segment end offset must be <= min_offset_to_keep
+        if (oldest.next_offset > min_offset_to_keep) {
+            break;
+        }
+
+        if (cfg_.retention_max_segments > 0 &&
+            segments_.size() <= cfg_.retention_max_segments) {
+            return;
+        }
+        
+
+        // Delete the segment file
+        if (oldest.file.is_open()) {
+            oldest.file.close();
+        }
+        std::filesystem::remove(oldest.path);
+
+        // How many entries belong to this segment?
+        uint64_t entries_to_remove =
+            oldest.next_offset - oldest.base_offset;
+
+        // Trim index prefix
+        if (entries_to_remove > 0 &&
+            entries_to_remove <= offset_index_.size()) {
+            offset_index_.erase(
+                offset_index_.begin(),
+                offset_index_.begin() + entries_to_remove);
+        }
+
+        // Advance base offset
+        base_logical_offset_ += entries_to_remove;
+
+        // Remove segment
+        segments_.erase(segments_.begin());
+
+        // Fix segment indices in remaining index
+        for (auto& ref : offset_index_) {
+            ref.seg -= 1;
+        }
+    }
 }
 
 } // namespace nebula

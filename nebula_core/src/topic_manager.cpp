@@ -48,7 +48,10 @@ TopicManager::TopicState& TopicManager::get_or_create_topic(const TopicConfig& c
         LogConfig log_cfg;
         log_cfg.directory = dir;
         log_cfg.base_filename = "segment";
-        log_cfg.max_segment_bytes = 8 * 1024 * 1024; // 8MB for now
+        log_cfg.max_segment_bytes = 512;        // for testing; set back later to 8 * 1024 * 1024
+        log_cfg.retention_max_segments = 3;     // keep 3 segments
+        log_cfg.retention_max_bytes = 0;        // disable bytes-based for now
+        
 
 
         PartitionState part;
@@ -121,10 +124,20 @@ std::optional<std::string> TopicManager::read_next(
     if (!val.has_value()) {
         return std::nullopt;
     }
-
-    // advance offset for this group and partition
+    
     current_offset += 1;
     save_group_offsets(topic, state);
+
+    uint64_t min_keep = current_offset;
+    for (const auto& kv : state.group_offsets) {
+        const auto& offs = kv.second;
+        if (partition_index < offs.size()) {
+            min_keep = std::min(min_keep, offs[partition_index]);
+        }
+    }
+
+    part.log->cleanup(min_keep);
+
     return val;
 }
 
